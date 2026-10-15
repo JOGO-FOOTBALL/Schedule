@@ -1,8 +1,43 @@
-__pycache__/
-.venv/
-# Bevat namen van teamleden
+# --- Data: names, schedules, hours (never in git) ---
 data/
 test_logos/
+*.csv
+*.xlsx
+*.xls
+*.json.bak
+instellingen.json
+
+# --- Secrets: passwords, keys, logins ---
 .env
-# Logins (gebruikers + wachtwoord-hashes)
+.env.*
+!.env.example
 auth/
+*.yaml.local
+.streamlit/secrets.toml
+*.pem
+*.key
+*.pfx
+*.p12
+credentials*
+secrets*
+
+# --- Claude Code: personal settings and memory ---
+.claude/settings.local.json
+.claude/projects/
+CLAUDE.local.md
+
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# --- Editors and OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
