@@ -1,21 +1,120 @@
-# Schedule – 433 social media team ⚽
+# Schedule · 433 ⚽
 
-A Streamlit app that builds the rota for the social media team. How many people are needed depends on the type of day, for example a Champions League night versus a regular matchday. The *Matches* tab shows the fixtures of the clubs you follow, taken from `MatchDataOLAP.EventBase` in Azure SQL, with club logos from Azure Blob Storage.
+A web app (Streamlit) for the 433 social media team. It does two things:
 
-## Getting started
+1. **Match calendar**: the matches of the clubs and countries we follow, week by week, with club logos.
+2. **Schedule**: who works when (Night 00–09, Day 09–17, Evening 16–00) and on which channel (Main, App, NL).
+   On request the app builds a proposed schedule that follows every rule. You can then adjust it by hand
+   and send it to Shiftbase one week at a time.
 
-Copy `.env.example` to `.env` and fill in the values:
+The schedule is shown inside the calendar: for each day you see who is working on the left and the matches on the right.
 
-- `MATCH_DB_SERVER`, `MATCH_DB_DATABASE`, `MATCH_DB_USERNAME`, `MATCH_DB_PASSWORD`: the SQL login for the matches.
-- `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_VAULT_URL`: Key Vault, used for the storage account that holds the club logos.
+---
 
-### With Docker
+## In short: how does it work?
+
+Step by step, this is what happens when someone opens the app:
+
+1. **Log in**: `auth.py` lets you log in with the same account as the expense-claim-generator.
+2. **Load data**: `storage.py` reads the team, the rules, time off and the schedule from CSV files in `data/`.
+3. **Fetch matches**: `matches.py` gets the matches from the database (Azure SQL) through `db.py`.
+   `clubs.py` decides which clubs we follow.
+4. **Logos**: `logos.py` creates temporary links to the club logos in Azure Blob Storage.
+5. **Draw the calendar**: `calendar_view.py` builds the calendar (HTML) with matches, schedule and the hours column.
+6. **Show it**: `main.py` puts everything on screen, with tabs for the team, rules, time off and so on.
+7. **Make a schedule** (only after clicking *Make schedule*): `scheduler.py` and `optimizer.py` work out
+   a schedule that follows all the rules. It is saved again through `storage.py`.
+8. **Drag or remove someone** in the calendar: `main.py` checks with `scheduler.py` whether it is allowed,
+   saves it and redraws the calendar.
+9. **To Shiftbase**: the *Send to Shiftbase* button next to a week makes `shiftbase.py` send only the
+   **new** shifts of that week to Shiftbase. Anything already in Shiftbase is never changed or deleted.
+
+Secrets (passwords, keys) come from `.env` or Azure Key Vault, through `config.py`.
+
+---
+
+## Every file, one by one
+
+### The code: `src/`
+
+| File | What it does |
+|---|---|
+| `main.py` | **The app itself.** This is where it starts. Builds every screen: the calendar with the schedule (tab *Matches*) and the tabs *Special events*, *Employees*, *Zero hours*, *Weeks & staffing*, *Staffing rules* and *Time off*. Also handles every click: dragging, ×, +, changing a channel, filling open slots, the Shiftbase dialog. |
+| `calendar_view.py` | **Draws the calendar** as HTML in 433 style (black, white, neon yellow). Per day the rows Night/Day/Evening with the people, the match cards with logos, red "open" slots, and per week the hours column (red = too few hours, orange = too many). |
+| `scheduler.py` | **The scheduling rules.** Knows how many people are needed per day, shift and channel, and checks whether a schedule breaks a rule (rest time, max shifts per week, weekend rule, days off, person rules, and so on). Also contains the simple fallback planner. |
+| `optimizer.py` | **The smart planner.** Uses Google OR-Tools to look at all weeks at once and find the best schedule: first as few open slots as possible, then fixed agreements, then contract hours, then preferences. If that fails, `scheduler.py` falls back to the simple planner. |
+| `storage.py` | **Saving and loading.** Every table (team, rules, schedule, time off, ...) is a CSV file in `data/`. It also holds the default values used when a file does not exist yet (for example the team and the Shiftbase IDs). |
+| `matches.py` | **Matches.** Fetches matches from `MatchDataOLAP.EventBase`, converts kick-off times to Dutch time, removes duplicate matches and decides which matches are "big" (for example El Clásico). |
+| `clubs.py` | **List of clubs and countries** we follow. The order matters: top = most popular. If a day has more than 5 matches, the calendar shows the most popular ones. Want to add a club? Add it to this list. |
+| `logos.py` | **Club logos.** Creates temporary read links (valid for 3 hours) to the logos in Azure Blob Storage. Nothing is downloaded. |
+| `db.py` | **Database connection** to Azure SQL (the matches). Needs *ODBC Driver 18 for SQL Server*. |
+| `config.py` | **Fetches secrets.** Looks for each password or key in `.env` first, then in Azure Key Vault. |
+| `auth.py` | **Login.** Uses the same accounts as the expense-claim-generator (a file in the Datascience Blob Storage). For now everyone who can log in has the same rights. |
+| `shiftbase.py` | **Shiftbase connection.** Reads what is in Shiftbase, compares it with our schedule and only creates new shifts. *Undo* only deletes shifts this tool created itself. Can be tested on its own: `python src/shiftbase.py`. |
+| `assets/` | Images for the calendar: the Champions League starball and the Europa League logo. |
+| `__pycache__/` | Created by Python itself. Leave it alone; it is not in git. |
+
+### Files in the main folder
+
+| File / folder | What it does |
+|---|---|
+| `README.md` | This file. |
+| `requirements.txt` | The Python packages the app needs (Streamlit, pandas, OR-Tools, Azure, ...). |
+| `Dockerfile` | Recipe for building the app into a container, including the SQL driver. |
+| `compose.yaml` | Starts the app with Docker at http://localhost:8503 and mounts the `data/` folder so your data is kept. |
+| `.dockerignore` | What must **not** go into the container (including `.env`, `data/`, `.git/`). |
+| `.gitignore` | What must **not** go into git: `data/` (names), `.env` (passwords), `auth/` (logins), `test_logos/`. |
+| `.env` | **Secret, not in git.** Passwords and keys (database, Azure, Shiftbase). Never share it. |
+| `.env.example` | Example of `.env` without real values: shows which settings are needed. |
+| `.streamlit/config.toml` | The 433 look of the app (colours, fonts) and automatic reload after saving. |
+| `.github/workflows/build-push-image.yml` | On every push to `main`, automatically builds a new container and puts it in Azure Container Registry (ACR). |
+| `.claude/settings.json` | Settings for Claude Code (the AI assistant used to work on this project). Not needed for the app. |
+| `set_contract_hours.py` | One-off helper script: set everyone's contract hours to 40 (Thijn 16). No need to run it again. |
+| `test_logos/` | Local test folder, not in git and not in the container. Not needed for the app. |
+| `data/` | **The app's data** (not in git, because it contains names). See below. |
+| `auth/` | Optional, not in git: a local login file `auth/config.yaml` for testing without the shared accounts. |
+
+### The `data/` folder
+
+This is where the app stores everything you enter in it. Each tab has its own file:
+
+| File | Contents |
+|---|---|
+| `employees.csv` | The team: channels, contract hours, Shiftbase ID, fixed days off, role (e.g. intern), ... |
+| `schedule.csv` | **The schedule**: per day who works which shift on which channel. |
+| `shifts.csv` | The shifts and their times (Night, Day, Evening). |
+| `staffing.csv` | How many people are needed per day type, shift and channel. |
+| `match_staffing.csv` | Extra staffing for matches and events. |
+| `person_rules.csv` | Person rules, e.g. "Karel only works on Main". |
+| `days.csv` | The day type per day (e.g. Champions League) and manual overrides. |
+| `afwezigheid.csv` | Time off and leave (whole day, day only or evening only). |
+| `zero_hours.csv` | Agreed days of zero-hours employees. |
+| `events.csv` | Special events (e.g. Ballon d'Or). |
+| `other_team.csv` | Who is with the other team (WomenFC) per month. |
+| `shiftbase_sent.csv` | Which shifts this tool has sent to Shiftbase (needed for *Undo*). |
+| `instellingen.json` | Loose settings, such as the minimum rest time between shifts. |
+
+If a file does not exist yet, the app uses the default values from `storage.py`.
+
+---
+
+## Starting the app
+
+### First: fill in `.env`
+
+Copy `.env.example` to `.env` and fill in the values (ask the administrator for them):
+
+- Match database: `MATCH_DB_SERVER`, `MATCH_DB_DATABASE`, `MATCH_DB_USERNAME`, `MATCH_DB_PASSWORD`
+- Azure Key Vault (for logos and logins): `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_VAULT_URL`
+- Shiftbase: `SHIFTBASE_API_KEY` (in Shiftbase: *Settings > App center > Public API*)
+
+### With Docker (recommended)
 
 ```bash
 docker compose up --build
 ```
 
-The app then runs at http://localhost:8503. The team, calendar and schedule are saved in `./data`. That folder is mounted as a volume, so your data survives a rebuild.
+Then open http://localhost:8503. After changing the code: stop with Ctrl+C and run the same command again.
 
 ### Without Docker
 
@@ -24,37 +123,43 @@ pip install -r requirements.txt
 streamlit run src/main.py
 ```
 
-This needs *ODBC Driver 18 for SQL Server* installed. Without it, the *Matches* tab can't load.
+This needs *ODBC Driver 18 for SQL Server* installed on your computer; without it the matches won't load.
 
-## Structure
+---
 
-```
-src/
-  main.py           Streamlit app (all tabs)
-  calendar_view.py  match calendar in 433 style (HTML)
-  matches.py        loading and preparing matches
-  logos.py          club logos from Blob Storage (temporary read links)
-  scheduler.py      automatic scheduling and checks
-  storage.py        storage as CSV in data/
-  db.py             Azure SQL connection (pyodbc)
-  config.py         secrets from .env / Azure Key Vault
-  assets/           Champions League starball for the calendar
-.streamlit/config.toml  433 theme (black, white, neon yellow)
-```
+## How to use the app
 
-## Tabs
+1. **Update the team** (tab *Employees*): channels, contract hours, Shiftbase ID, fixed days off, and so on.
+2. **Enter time off** (tab *Time off*) and any zero-hours days (tab *Zero hours*).
+3. **Check the rules** (tab *Staffing rules*): staffing per day type, person rules and extra staffing for matches.
+4. **Make a schedule**: choose *From week* and *Until week* at the top and click **Make schedule**.
+   Nothing is ever scheduled on its own: only when you click that button.
+5. **Adjust in the calendar**:
+   - **drag** people to another shift or day;
+   - **×** to remove someone, **+** to add someone;
+   - click the **channel** to change it;
+   - click a red **open** slot to pick someone who is allowed to work there by the rules.
 
-1. **⚽ Matches**: a weekly calendar with the matches of the clubs you follow (by default Barcelona, Real Madrid, Juventus, Manchester City and FC Utrecht). You can type extra clubs into *Clubs*; the list is saved. Each card shows the kick-off time (Amsterdam time) and both logos. Champions League days get their own blue background. Under *Teams* you choose which teams with those names count, for example to leave out youth or women's teams. If some logos can't be found, a *Logos* panel shows which ones. Data is cached for an hour; *Refresh* reloads it straight away.
-2. **👥 Team**: names, seniority (Junior / Medior / Senior / Lead), max shifts per week and fixed days off.
-3. **📅 Weeks & staffing**: the day type for each day (Champions League, Eredivisie matchday, Transfer Deadline Day, ...). *Quick set* lets you set, say, every Tuesday and Wednesday to Champions League in one go. At the bottom you see the shifts needed per week next to the team's capacity.
-4. **⚙️ Staffing rules**: the shifts (times) and, per day type and shift, how many people are needed and how many of them must be senior. This is also where you set the minimum rest between shifts.
-5. **🏖️ Time off**: holidays and leave.
-6. **🗓️ Schedule**: *Generate proposal* builds a schedule automatically, which you can then edit by hand. The check shows shortages and conflicts, and you can download everything as Excel.
+   If a change breaks a rule, the app tells you why it isn't possible.
+6. **Check the hours** in the column on the right: red = under contract, orange = over contract. The reason is shown below it.
+7. **To Shiftbase**: click *Send to Shiftbase* next to a week. You first see what will be sent.
+   Only lines with status **new** are created. *Undo* removes them again.
 
-Senior and Lead count as "senior". `data/` and `.env` are in `.gitignore` because they contain names and credentials.
+### Main scheduling rules
 
-## Deploy
+- At most 2 weekend shifts per week (Friday evening counts as weekend). After such a weekend, the weekend before and after has at most 1.
+- Enough rest between shifts (11 hours by default) and no more shifts per week than set in *Employees*.
+- Topping up to contract hours only happens on weekdays, preferably on shifts with many matches.
+- Interns work Mon–Fri day shifts, never at weekends, and never alone on their channel.
+- Champions League evening: 2 on Main, 2 on App, 2 on NL.
 
-`.github/workflows/build-push-image.yml` builds an image on every push to `main` and pushes it to ACR, like the other projects. It needs these repository secrets: `ACR_SERVER`, `ACR_USERNAME` and `ACR_PASSWORD`.
+---
 
-Note: in a container in Azure, `data/` is lost on every restart. Move storage to Blob Storage before deploying.
+## Going live (deploy)
+
+On every push to `main`, GitHub automatically builds a new container (see `.github/workflows/build-push-image.yml`)
+and puts it in Azure Container Registry. This needs the repository secrets `ACR_SERVER`, `ACR_USERNAME` and
+`ACR_PASSWORD`.
+
+**Note:** in a container in Azure, the `data/` folder is lost on every restart. Move storage to Blob Storage
+before the app really goes live.
