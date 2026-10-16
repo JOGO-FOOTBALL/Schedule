@@ -24,17 +24,6 @@ def _container():
     return BlobServiceClient(f"https://{name}.blob.core.windows.net", credential=key).get_container_client(CONTAINER), name, key
 
 
-def sample_names(limit: int = 8) -> list[str]:
-    """Een paar bestandsnamen onder logos/club/ (voor diagnose: klopt het id-formaat?)."""
-    container, _, _ = _container()
-    names = []
-    for blob in container.list_blobs(name_starts_with=PREFIX):
-        names.append(blob.name)
-        if len(names) >= limit:
-            break
-    return names
-
-
 LEAGUE_PREFIX = "logos/league/"
 
 
