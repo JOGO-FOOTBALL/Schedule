@@ -4,7 +4,7 @@ Alle weken worden in één keer bekeken, zodat het ene weekend niet de restjes v
 Harde regels (één dienst per dag, rusttijd, max per week, weekendregel, kanalen, vrije dagen, persoonsregels)
 gelden altijd; de rest weegt mee in een score:
 
-    open plekken  >>  vaste afspraken (altijd werken, nuluren, UCL)  >  contracturen  >  weekminimum
+    afgesproken nul-urendagen  >  open plekken  >>  vaste afspraken (altijd werken, UCL)  >  contracturen  >  weekminimum
     >  voorkeuren / afwisseling / extra mensen waar de wedstrijden zijn
 
 Geeft None terug als OR-Tools er niet is of geen oplossing vindt; dan gebruikt scheduler.py de oude planner.
@@ -13,7 +13,7 @@ Geeft None terug als OR-Tools er niet is of geen oplossing vindt; dan gebruikt s
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pandas as pd
 
@@ -21,7 +21,8 @@ import scheduler as sch
 
 # Gewichten (hoger = belangrijker).
 W_SHORT = {0: 1000, 1: 900, 2: 600, 3: 800}  # open plek: NL-sleuteldienst, weekendavond, weekenddag, doordeweeks
-W_MUST = 700  # vaste afspraak niet gehaald (Always works, vaste dagen, nuluren, UCL-persoon)
+W_MUST = 700  # vaste afspraak niet gehaald (Always works, vaste dagen, UCL-persoon)
+W_ZERO = 5000  # afgesproken nul-urendag niet ingepland: zwaarder dan alles, alleen een harde regel kan het tegenhouden
 W_CONTRACT = 120  # per dienst onder de contracturen
 W_WEEK_MIN = 40  # geen doordeweekse avond / geen weekenddienst die week
 W_WEEKEND_EXTRA = 200  # meer mensen in het weekend dan nodig
@@ -50,7 +51,7 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
     rules_df = person_rules if person_rules is not None else pd.DataFrame(columns=["naam", "regel", "waarde"])
     min_rest = timedelta(hours=min_rest_hours)
 
-    people = team[team["actief"] & team["auto"]]
+    people = team[team["actief"] & (team["auto"] | team["nuluren"])]  # nuluren: altijd op de afgesproken dagen
     info = {r.naam: r for r in people.itertuples()}
     names = list(info)
     weeks = sorted({sch.week_key(d) for d in days})
@@ -217,10 +218,10 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
         for d in days:
             if sch._is_absent(n, d, absence_map):
                 continue
-            want = None
+            want, weight = None, W_MUST
             if agreed is not None and d in agreed:
                 want = None if agreed[d] == sch.ANY_SHIFT else agreed[d]
-                must = True
+                must, weight = True, W_ZERO
             elif any(d.weekday() in ds for _, ds in always):
                 want = next(s for s, ds in always if d.weekday() in ds)
                 must = True
@@ -234,7 +235,7 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
                 vs = works(n, d, want)
                 miss = m.NewBoolVar(f"miss_{n}_{d}")
                 m.Add(sum(vs) + miss >= 1)
-                terms.append(W_MUST * miss)
+                terms.append(weight * miss)
 
     # --- contracturen, weekminimum, voorkeuren, afwisseling --------------------------
     for n in names:
