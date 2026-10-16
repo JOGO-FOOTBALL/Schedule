@@ -219,11 +219,6 @@ CSS = """
 OTHER_CONFEDERATIONS = ("afc", "caf", "concacaf", "ofc", "asia", "africa", "arab")
 
 
-def is_champions_league(name) -> bool:
-    c = competition_of(name)
-    return c is not None and c[0] == "ucl"
-
-
 def competition_of(name) -> tuple[str, str, str] | None:
     """Welke Europese competitie (uit COMPETITIONS) hoort bij deze competitie- of dagtypenaam?"""
     lowered = str(name or "").lower()
@@ -291,7 +286,8 @@ def _chips(group: pd.DataFrame | None, flags: dict | None = None) -> str:
         f'title="{escape(" / ".join(flags.get((r.datum, r.naam), [])) or CHANNEL_NAMES.get(r.kanaal, r.kanaal))}" '
         f'draggable="true" data-name="{escape(r.naam)}" data-date="{r.datum.isoformat()}" '
         f'data-shift="{escape(r.dienst)}" data-channel="{escape(r.kanaal)}">'
-        f'<i>{SHORT.get(r.kanaal, "?")}</i>{escape(r.naam)}<b class="mc-x" title="Remove from this shift">×</b></span>'
+        + (f'<i>{SHORT[r.kanaal]}</i>' if r.kanaal in SHORT else "")  # geen kanaal (Shiftbase-tab): alleen de naam
+        + f'{escape(r.naam)}<b class="mc-x" title="Remove from this shift">×</b></span>'
         for r in sorted(group.itertuples(), key=lambda r: (order.get(r.kanaal, 9), r.naam))
     )
 
@@ -348,7 +344,7 @@ def _hours(week_start: date, roster: pd.DataFrame | None, contracts: dict[str, i
            shift_hours: dict[str, float], away: dict[str, set[date]], explain=None) -> str:
     """Per persoon de ingeplande uren in deze week naast de contracturen.
 
-    Wie de hele week weg is (vrij, of bij een ander team zoals WomenFC), telt niet mee; wie een paar dagen
+    Wie de hele week weg is (vrij), telt niet mee; wie een paar dagen
     weg is, wordt vergeleken met de uren die nog konden (bijv. 2 dagen beschikbaar = 16 uur).
     """
     week_days = {week_start + timedelta(days=i) for i in range(7)}
@@ -390,10 +386,11 @@ def render(games: pd.DataFrame, period: list[date], day_types: dict[date, str],
            events: dict[date, list[str]] | None = None, roster: pd.DataFrame | None = None,
            contracts: dict[str, int] | None = None,
            shift_hours: dict[str, float] | None = None, away: dict[str, set[date]] | None = None,
-           flags: dict | None = None, missing: dict | None = None, explain=None) -> str:
+           flags: dict | None = None, missing: dict | None = None, explain=None, readonly: bool = False) -> str:
+    """`readonly`: alleen bekijken (bijv. wat in Shiftbase staat): geen ×, + of Send to Shiftbase."""
     crew_by_day = {d: g for d, g in roster.groupby("datum")} if roster is not None and not roster.empty else {}
     if games.empty and roster is None and not any(d in (events or {}) for d in period):
-        return CSS + f'<div class="mc"><div class="mc-empty">No matches in this period.</div></div>'
+        return CSS + '<div class="mc"><div class="mc-empty">No matches in this period.</div></div>'
 
     by_day = {}  # één keer door de wedstrijden i.p.v. per dag (sneller), zelfde volgorde
     for g in games.itertuples():
@@ -475,4 +472,6 @@ def render(games: pd.DataFrame, period: list[date], day_types: dict[date, str],
     legend = "".join(f'<span class="mc-chip c-{c}"><i>{SHORT[c]}</i>{label}</span>' for c, label in CHANNEL_NAMES.items())
     parts.append(f'<div class="mc-foot"><span>Times in Amsterdam time (CET/CEST)<span class="mc-legend">{legend}</span></span>'
                  '<b>433</b></div></div>')
+    if readonly:
+        parts.append("<style>.mc-x, .mc-add, .mc-sb { display:none !important; } .mc-chip { cursor:default; }</style>")
     return "".join(parts)
