@@ -1,19 +1,18 @@
-"""Opslag van alle tabellen als CSV in de map data/."""
+"""Opslag van alle tabellen als CSV: in de map data/, of in Azure Blob Storage als
+SCHEDULE_BLOB_CONTAINER is ingesteld (zie blob_store.py)."""
 
 from __future__ import annotations
 
-import json
+import io
 import os
 from pathlib import Path
 
 import pandas as pd
 
+import blob_store
+
 # Standaard de map data/ in de projectroot; in Docker gemount als volume.
 DATA_DIR = Path(os.environ.get("DATA_DIR") or Path(__file__).resolve().parent.parent / "data")
-
-DEFAULT_SETTINGS = {
-    "min_rust_uren": 11,
-}
 
 CHANNELS = ["main", "app", "nl"]
 
@@ -22,13 +21,13 @@ TEAM_COLUMNS = [
     "vaste_dienst", "vaste_dagen", "ucl", "actief", "notitie",
 ]
 _EMPLOYEES = ["Karel", "Jonathan", "Luuk", "Kadir", "Francisco", "Joshua", "Thijn",
-              "Justin", "Maybel*", "Tim", "Rogier", "Mats", "Thomas*", "Arodi*"]
+              "Justin", "Maybel*", "Tim", "Rogier", "Thomas*", "Arodi*"]
 _ONLY = {"Kadir": "app", "Francisco": "app", "Luuk": "app", "Jonathan": "main"}
 _MANUAL_ONLY = {"Rogier", "Tim"}  # niet automatisch inroosteren
 # Nummer van de medewerker in Shiftbase (voor het versturen van het rooster). Arodi: het nieuwste account.
 SHIFTBASE_IDS = {
-    "Aniek": "760456", "Emily": "1592456", "Francisco": "997192", "Jonathan": "1000286", "Joshua": "1494199",
-    "Justin": "1332930", "Kadir": "870467", "Karel": "1388199", "Luuk": "1494201", "Mats": "1433271",
+    "Francisco": "997192", "Jonathan": "1000286", "Joshua": "1494199",
+    "Justin": "1332930", "Kadir": "870467", "Karel": "1388199", "Luuk": "1494201",
     "Maybel": "1568624", "Rogier": "774750", "Thijn": "1332929", "Thomas": "760457", "Tim": "760510",
     "Arodi": "1604152",
 }
@@ -44,12 +43,6 @@ DEFAULT_TEAM = pd.DataFrame(
         for n in _EMPLOYEES
     ],
     columns=TEAM_COLUMNS,
-)
-
-# Per maand bij een ander team (bijv. WomenFC): die maand niet in dit rooster.
-DEFAULT_OTHER_TEAM = pd.DataFrame(
-    [],
-    columns=["naam", "maand", "team"],
 )
 
 # Regels per persoon; de soorten staan in scheduler.RULE_TYPES.
@@ -91,8 +84,7 @@ DEFAULT_RULES = pd.DataFrame(
 )
 
 EMPTY = {
-    "days": ["datum", "handmatig", "notitie"],
-    "afwezigheid": ["naam", "van", "tot", "deel", "reden"],  # deel: "" = hele dag, "Day" of "Evening"
+    "afwezigheid": ["naam", "van", "tot", "deel"],  # deel: "" = hele dag, "Day" of "Evening"
     "schedule": ["datum", "dienst", "kanaal", "naam"],
     "events": ["titel", "datum"],
 }
@@ -103,6 +95,11 @@ def _path(name: str) -> Path:
 
 
 def _read(name: str, default: pd.DataFrame) -> pd.DataFrame:
+    if blob_store.enabled():
+        data = blob_store.read(f"{name}.csv")
+        if data is None:
+            return default.copy()
+        return pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False)
     path = _path(name)
     if not path.exists():
         return default.copy()
@@ -110,6 +107,9 @@ def _read(name: str, default: pd.DataFrame) -> pd.DataFrame:
 
 
 def _write(name: str, df: pd.DataFrame) -> None:
+    if blob_store.enabled():
+        blob_store.write(f"{name}.csv", df.to_csv(index=False).encode("utf-8"))
+        return
     DATA_DIR.mkdir(exist_ok=True)
     df.to_csv(_path(name), index=False)
 
@@ -168,16 +168,6 @@ def clean_team(df: pd.DataFrame) -> pd.DataFrame:
     return df[TEAM_COLUMNS].reset_index(drop=True)
 
 
-def clean_shifts(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for col in df.columns:
-        df[col] = _text(df[col])
-    valid = df["start"].str.fullmatch(r"\d{1,2}:\d{2}") & df["eind"].str.fullmatch(r"\d{1,2}:\d{2}")
-    df["dienst"] = (df["dienst"])
-    df = df[(df["dienst"] != "") & valid].drop_duplicates("dienst")
-    return df.reset_index(drop=True)
-
-
 def clean_rules(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["dagtype"] = _text(df["dagtype"])
@@ -188,15 +178,6 @@ def clean_rules(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def clean_days(df: pd.DataFrame) -> pd.DataFrame:
-    """Per datum een handmatig gekozen dagtype (leeg = automatisch) en een notitie."""
-    df = df.copy()
-    df["datum"] = _dates(df["datum"])
-    df["handmatig"] = _text(df["handmatig"])
-    df["notitie"] = _text(df["notitie"])
-    return df.dropna(subset=["datum"]).drop_duplicates("datum", keep="last").reset_index(drop=True)
-
-
 def clean_absences(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["naam"] = _text(df["naam"])
@@ -205,7 +186,6 @@ def clean_absences(df: pd.DataFrame) -> pd.DataFrame:
     df["tot"] = df["tot"].where(df["tot"].notna(), df["van"])
     df["deel"] = _text(df["deel"]) if "deel" in df else ""
     df["deel"] = df["deel"].replace({"Whole day": "", "All day": "", "Day off": "Day", "Evening off": "Evening"})
-    df["reden"] = _text(df["reden"]) if "reden" in df else ""
     return df[(df["naam"] != "")].dropna(subset=["van"])[EMPTY["afwezigheid"]].reset_index(drop=True)
 
 
@@ -215,24 +195,6 @@ def clean_events(df: pd.DataFrame) -> pd.DataFrame:
     df["datum"] = _dates(df["datum"])
     df = df[df["titel"] != ""].dropna(subset=["datum"])
     return df.sort_values("datum").reset_index(drop=True)
-
-
-def clean_other_team(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["naam"] = _text(df["naam"])
-    df["maand"] = _text(df["maand"])
-    df["team"] = _text(df["team"]).replace("", "WomenFC")
-    df = df[(df["naam"] != "") & df["maand"].str.fullmatch(r"\d{4}-\d{2}")]
-    return df.drop_duplicates(["naam", "maand"], keep="last").sort_values(["maand", "naam"]).reset_index(drop=True)
-
-
-def other_team_as_absences(df: pd.DataFrame) -> pd.DataFrame:
-    """Een maand bij een ander team telt voor de planning als afwezig, de hele maand."""
-    first = pd.to_datetime(df["maand"] + "-01")
-    return pd.DataFrame({
-        "naam": df["naam"], "van": first.dt.date, "tot": (first + pd.offsets.MonthEnd(0)).dt.date, "deel": "",
-        "reden": df["team"],
-    }, columns=EMPTY["afwezigheid"])
 
 
 def clean_person_rules(df: pd.DataFrame) -> pd.DataFrame:
@@ -283,17 +245,12 @@ def load_team():
 
 
 def load_shifts():
-    shifts = clean_shifts(_read("shifts", DEFAULT_SHIFTS))
-    missing = DEFAULT_SHIFTS[~DEFAULT_SHIFTS["dienst"].isin(shifts["dienst"])]  # nieuwe standaarddiensten (Night)
-    return pd.concat([shifts, missing], ignore_index=True)
+    """De diensten met hun tijden. Vast in de code (geen tabel meer); aanpassen: DEFAULT_SHIFTS hierboven."""
+    return DEFAULT_SHIFTS.copy()
 
 
 def load_rules():
     return clean_rules(_read("staffing", DEFAULT_RULES))
-
-
-def load_days():
-    return clean_days(_read("days", pd.DataFrame(columns=EMPTY["days"])))
 
 
 def load_absences():
@@ -302,10 +259,6 @@ def load_absences():
 
 def load_events():
     return clean_events(_read("events", pd.DataFrame(columns=EMPTY["events"])))
-
-
-def load_other_team():
-    return clean_other_team(_read("other_team", DEFAULT_OTHER_TEAM))
 
 
 def load_person_rules():
@@ -343,16 +296,3 @@ def load_roster():
 
 def save(name: str, df: pd.DataFrame) -> None:
     _write(name, df)
-
-
-def load_settings() -> dict:
-    path = DATA_DIR / "instellingen.json"
-    settings = dict(DEFAULT_SETTINGS)
-    if path.exists():
-        settings.update(json.loads(path.read_text(encoding="utf-8")))
-    return settings
-
-
-def save_settings(settings: dict) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    (DATA_DIR / "instellingen.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
