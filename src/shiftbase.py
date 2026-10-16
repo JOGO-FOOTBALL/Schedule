@@ -1,9 +1,8 @@
-"""Koppeling met Shiftbase (https://api.shiftbase.com/api). Voor nu alleen LEZEN: testen of de verbinding werkt.
+"""Koppeling met Shiftbase (https://api.shiftbase.com/api).
 
 De API-sleutel staat in .env als SHIFTBASE_API_KEY (aanmaken in Shiftbase: Settings > App center > Public API).
+Verbinding testen (alleen lezen), vanuit de projectmap:  python src/shiftbase.py
 
-Testen (vanuit de projectmap):  python src/shiftbase.py
-Wat staat er (koppeling maken):  python src/shiftbase.py discover
 Lezen gebeurt met GET. Versturen (create_roster) maakt ALLEEN nieuwe diensten aan; undo (delete_roster) haalt
 alleen diensten weg die deze tool zelf heeft aangemaakt (bijgehouden in data/shiftbase_sent.csv).
 """
@@ -147,10 +146,42 @@ def existing_rosters(min_date: date, max_date: date) -> list[dict]:
     for item in raw:
         r = item.get("Roster") if isinstance(item, dict) else None
         if isinstance(r, dict) and str(r.get("department_id")) == CONTENT_DEPARTMENT_ID:
+            user = item.get("User") if isinstance(item.get("User"), dict) else {}
             result.append({"id": str(r.get("id")), "user_id": str(r.get("user_id")), "date": str(r.get("date")),
                            "shift_id": str(r.get("shift_id")), "starttime": str(r.get("starttime"))[:5],
-                           "endtime": str(r.get("endtime"))[:5], "description": str(r.get("description") or "")})
+                           "endtime": str(r.get("endtime"))[:5], "description": str(r.get("description") or ""),
+                           "user_name": str(user.get("first_name") or user.get("name") or "").strip()})
     return result
+
+
+def calendar_roster(min_date: date, max_date: date, names: dict[str, str], hidden: tuple[str, ...] = ()):
+    """Wat er in Shiftbase staat, als rooster voor de kalender (datum, dienst, kanaal, naam). Alleen lezen.
+
+    `names`: Shiftbase-id -> naam zoals op de Employees-pagina. Dienst: via de dienstsoort (DAYS/Even/NS), anders
+    via de begintijd. Kanaal: uit de notitie (Main/App/NL), anders "" (alleen de naam). Mensen in `hidden` worden
+    overgeslagen. De tijden staan achter de naam, bijv. "Karel 9–17"."""
+    import pandas as pd
+
+    by_shift_id = {v: k for k, v in SHIFT_IDS.items()}
+    channels = {v.lower(): k for k, v in CHANNEL_NOTE.items()}
+    rows = []
+    day = min_date
+    while day <= max_date:  # per week ophalen: kleine verzoeken
+        last = min(day + timedelta(days=6), max_date)
+        for r in existing_rosters(day, last):
+            start, end = r["starttime"], r["endtime"]
+            dienst = by_shift_id.get(r["shift_id"]) or ("Night" if start < "06:00" else "Evening" if start >= "15:00" else "Day")
+            name = names.get(r["user_id"]) or r["user_name"] or f"#{r['user_id']}"
+            if name in hidden:
+                continue
+            # Tijden kort achter de naam, bijv. "Karel 9–17", "Joshua 10:30–18" of "Thomas 16–24" (tot middernacht)
+            short = [str(int(t[:2])) + ("" if t.endswith(":00") else t[2:]) for t in (start, end)]
+            name += f" {short[0]}–{'24' if end == '00:00' else short[1]}"
+            note = r["description"].strip().lower()
+            rows.append({"datum": date.fromisoformat(r["date"]), "dienst": dienst,
+                         "kanaal": channels.get(note, ""), "naam": name})
+        day = last + timedelta(days=1)
+    return pd.DataFrame(rows, columns=["datum", "dienst", "kanaal", "naam"])
 
 
 def shift_breaks() -> dict[str, str]:
@@ -218,85 +249,5 @@ def preview(planned, ids: dict[str, str], shift_times: dict[str, tuple[str, str]
         ["Date", "Name"]).reset_index(drop=True)
 
 
-def items(data) -> list[dict]:
-    """Lijst uit een antwoord; Shiftbase verpakt elk item soms per model, bijv. {"User": {...}}."""
-    if isinstance(data, dict) and "data" in data:
-        data = data["data"]
-    if isinstance(data, dict):
-        data = [data]
-    result = []
-    for item in data or []:
-        if isinstance(item, dict) and len(item) >= 1 and all(isinstance(v, (dict, list)) for v in item.values()):
-            main = next((v for v in item.values() if isinstance(v, dict)), item)
-            result.append({**main, "_wrapped": list(item)})
-        else:
-            result.append(item)
-    return result
-
-
-def _pick(item: dict, *names):
-    return next((item[n] for n in names if n in item and item[n] not in (None, "")), "")
-
-
-def discover(employee_names: list[str]) -> None:
-    """Alleen lezen: wat staat er in Shiftbase, zodat we de koppeling kunnen maken."""
-    def show(path, fields):
-        status, data = get(path)
-        rows = items(data) if status == 200 else []
-        print(f"\n== {path} (HTTP {status}, {len(rows)} items) ==")
-        if rows:
-            print("   fields:", ", ".join(k for k in rows[0] if not k.startswith("_")))
-        for r in rows:
-            print("  ", " | ".join(f"{f}={_pick(r, f)}" for f in fields if _pick(r, f) != ""))
-        return rows
-
-    show("departments", ["id", "name"])
-    show("teams", ["id", "name", "department_id"])
-    show("shifts", ["id", "name", "long_name", "starttime", "endtime", "department_id"])
-
-    status, data = get("users")
-    users = items(data) if status == 200 else []
-    wanted = {n.lower() for n in employee_names}
-    print(f"\n== users (HTTP {status}): matching the {len(employee_names)} employees in the tool ==")
-    if users:
-        print("   fields:", ", ".join(k for k in users[0] if not k.startswith("_")))
-    found = set()
-    for u in users:
-        first = str(_pick(u, "first_name", "firstname")).strip()
-        full = str(_pick(u, "name", "display_name")).strip() or f"{first} {_pick(u, 'last_name', 'lastname')}".strip()
-        if first.lower() in wanted or full.split(" ")[0].lower() in wanted:
-            found.add(first.lower() or full.split(" ")[0].lower())
-            print(f"   id={_pick(u, 'id')} | name={full} | active={_pick(u, 'active', 'enabled')}")
-    missing = sorted(wanted - found)
-    if missing:
-        print("   not found by first name:", ", ".join(missing))
-
-    monday = date.today() - timedelta(days=date.today().weekday())
-    status, data = get("rosters", {"min_date": monday.isoformat(), "max_date": (monday + timedelta(days=6)).isoformat()})
-    rosters = items(data) if status == 200 else []
-    print(f"\n== rosters this week (HTTP {status}): structure of one item, without its values ==")
-    if rosters:
-        print("   wrapped as:", rosters[0].get("_wrapped"))
-        print("   fields:", ", ".join(k for k in rosters[0] if not k.startswith("_")))
-    raw = data.get("data", []) if isinstance(data, dict) else (data or [])
-    content = [r for r in raw if isinstance(r, dict) and isinstance(r.get("Roster"), dict)
-               and str(r["Roster"].get("team_id")) == CONTENT_TEAM_ID]
-    sample = (content or [r for r in raw if isinstance(r, dict) and isinstance(r.get("Roster"), dict)])[:1]
-    if sample:
-        roster = sample[0]["Roster"]
-        print("\n== Roster fields (one example, ids/dates/times only) ==")
-        safe = ("id", "date", "starttime", "endtime", "shift_id", "team_id", "department_id", "user_id",
-                "break", "published", "type", "occurrence_id", "recurring", "hide_end_time")
-        for k, v in roster.items():
-            print(f"   {k} = {v if k in safe or k.endswith('_id') else '(…)'}")
-
-
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "discover":
-        import storage
-
-        discover(list(storage.load_team()["naam"]))
-    else:
-        check_connection()
+    check_connection()
