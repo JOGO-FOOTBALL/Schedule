@@ -39,11 +39,12 @@ Secrets (passwords, keys) come from `.env` or Azure Key Vault, through `config.p
 
 | File | What it does |
 |---|---|
-| `main.py` | **The app itself.** This is where it starts. Builds every screen: the calendar with the schedule (tab *Matches*) and the tabs *Special events*, *Employees*, *Zero hours*, *Weeks & staffing*, *Staffing rules* and *Time off*. Also handles every click: dragging, ×, +, changing a channel, filling open slots, the Shiftbase dialog. |
+| `main.py` | **The app itself.** This is where it starts. Builds every screen: the calendar with the schedule (tab *Matches*), the same calendar with what is in Shiftbase now (tab *Shiftbase*, read only) and the tabs *Special events*, *Employees*, *Zero hours*, *Staffing rules* and *Time off*. Also handles every click: dragging, ×, +, changing a channel, filling open slots, the Shiftbase dialog. |
 | `calendar_view.py` | **Draws the calendar** as HTML in 433 style (black, white, neon yellow). Per day the rows Night/Day/Evening with the people, the match cards with logos, red "open" slots, and per week the hours column (red = too few hours, orange = too many). |
-| `scheduler.py` | **The scheduling rules.** Knows how many people are needed per day, shift and channel, and checks whether a schedule breaks a rule (rest time, max shifts per week, weekend rule, days off, person rules, and so on). Also contains the simple fallback planner. |
+| `scheduler.py` | **The scheduling rules.** Knows how many people are needed per day, shift and channel, and checks whether a schedule breaks a rule (rest time of 11 hours, fixed in the code as `MIN_REST_HOURS`, max shifts per week, weekend rule, days off, person rules, and so on). Also contains the simple fallback planner. |
 | `optimizer.py` | **The smart planner.** Uses Google OR-Tools to look at all weeks at once and find the best schedule: first as few open slots as possible, then fixed agreements, then contract hours, then preferences. If that fails, `scheduler.py` falls back to the simple planner. |
-| `storage.py` | **Saving and loading.** Every table (team, rules, schedule, time off, ...) is a CSV file in `data/`. It also holds the default values used when a file does not exist yet (for example the team and the Shiftbase IDs). |
+| `storage.py` | **Saving and loading.** Every table (team, rules, schedule, time off, ...) is a CSV file, in `data/` or in Azure Blob Storage (see `blob_store.py`). It also holds the default values used when a file does not exist yet (for example the team and the Shiftbase IDs), and the fixed shift times (Night 00–09, Day 09–17, Evening 16–00). |
+| `blob_store.py` | **Storage in Azure Blob Storage** instead of `data/`, switched on with `SCHEDULE_BLOB_CONTAINER` and `SCHEDULE_BLOB_SAS_URL` in `.env`. Access goes through a SAS link that Azure itself limits to that one container (no delete rights), so the app cannot touch anything else, such as the expense-claim-generator logins. On top of that, the code only allows the fixed list of schedule files under `data/`. |
 | `matches.py` | **Matches.** Fetches matches from `MatchDataOLAP.EventBase`, converts kick-off times to Dutch time, removes duplicate matches and decides which matches are "big" (for example El Clásico). |
 | `clubs.py` | **List of clubs and countries** we follow. The order matters: top = most popular. If a day has more than 5 matches, the calendar shows the most popular ones. Want to add a club? Add it to this list. |
 | `logos.py` | **Club logos.** Creates temporary read links (valid for 3 hours) to the logos in Azure Blob Storage. Nothing is downloaded. |
@@ -69,7 +70,6 @@ Secrets (passwords, keys) come from `.env` or Azure Key Vault, through `config.p
 | `.streamlit/config.toml` | The 433 look of the app (colours, fonts) and automatic reload after saving. |
 | `.github/workflows/build-push-image.yml` | On every push to `main`, automatically builds a new container and puts it in Azure Container Registry (ACR). |
 | `.claude/settings.json` | Settings for Claude Code (the AI assistant used to work on this project). Not needed for the app. |
-| `set_contract_hours.py` | One-off helper script: set everyone's contract hours to 40 (Thijn 16). No need to run it again. |
 | `test_logos/` | Local test folder, not in git and not in the container. Not needed for the app. |
 | `data/` | **The app's data** (not in git, because it contains names). See below. |
 | `auth/` | Optional, not in git: a local login file `auth/config.yaml` for testing without the shared accounts. |
@@ -82,17 +82,13 @@ This is where the app stores everything you enter in it. Each tab has its own fi
 |---|---|
 | `employees.csv` | The team: channels, contract hours, Shiftbase ID, fixed days off, role (e.g. intern), ... |
 | `schedule.csv` | **The schedule**: per day who works which shift on which channel. |
-| `shifts.csv` | The shifts and their times (Night, Day, Evening). |
 | `staffing.csv` | How many people are needed per day type, shift and channel. |
 | `match_staffing.csv` | Extra staffing for matches and events. |
 | `person_rules.csv` | Person rules, e.g. "Karel only works on Main". |
-| `days.csv` | The day type per day (e.g. Champions League) and manual overrides. |
 | `afwezigheid.csv` | Time off and leave (whole day, day only or evening only). |
 | `zero_hours.csv` | Agreed days of zero-hours employees. |
 | `events.csv` | Special events (e.g. Ballon d'Or). |
-| `other_team.csv` | Who is with the other team (WomenFC) per month. |
 | `shiftbase_sent.csv` | Which shifts this tool has sent to Shiftbase (needed for *Undo*). |
-| `instellingen.json` | Loose settings, such as the minimum rest time between shifts. |
 
 If a file does not exist yet, the app uses the default values from `storage.py`.
 
@@ -142,13 +138,14 @@ This needs *ODBC Driver 18 for SQL Server* installed on your computer; without i
 
    If a change breaks a rule, the app tells you why it isn't possible.
 6. **Check the hours** in the column on the right: red = under contract, orange = over contract. The reason is shown below it.
-7. **To Shiftbase**: click *Send to Shiftbase* next to a week. You first see what will be sent.
+7. **See what is in Shiftbase**: the tab *Shiftbase* shows the same calendar, but with the shifts as they are in Shiftbase now (read only; *Refresh* reads it again).
+8. **To Shiftbase**: click *Send to Shiftbase* next to a week. You first see what will be sent.
    Only lines with status **new** are created. *Undo* removes them again.
 
 ### Main scheduling rules
 
 - At most 2 weekend shifts per week (Friday evening counts as weekend). After such a weekend, the weekend before and after has at most 1.
-- Enough rest between shifts (11 hours by default) and no more shifts per week than set in *Employees*.
+- At least 11 hours rest between shifts and no more shifts per week than set in *Employees*.
 - Topping up to contract hours only happens on weekdays, preferably on shifts with many matches.
 - Interns work Mon–Fri day shifts, never at weekends, and never alone on their channel.
 - Champions League evening: 2 on Main, 2 on App, 2 on NL.
@@ -161,5 +158,25 @@ On every push to `main`, GitHub automatically builds a new container (see `.gith
 and puts it in Azure Container Registry. This needs the repository secrets `ACR_SERVER`, `ACR_USERNAME` and
 `ACR_PASSWORD`.
 
-**Note:** in a container in Azure, the `data/` folder is lost on every restart. Move storage to Blob Storage
-before the app really goes live.
+**Note:** in a container in Azure, the `data/` folder is lost on every restart. So online, store the data in
+Blob Storage:
+
+1. In the Azure portal, in the Datascience storage account, create a container `schedule-app` (private).
+2. On that container, create a SAS token (*Shared access tokens*): permissions **Read, Add, Create, Write, List**
+   (not Delete), an expiry date (e.g. one year, set a reminder), HTTPS only. Copy the **Blob SAS URL**.
+3. Add both to `.env` (and to the settings of the app in Azure):
+   `SCHEDULE_BLOB_CONTAINER=schedule-app` and `SCHEDULE_BLOB_SAS_URL=<the Blob SAS URL>`.
+4. Move the current data across once, from the project folder: `python src/blob_store.py upload`.
+   This only uploads files that are not in the blob yet; it never overwrites anything.
+5. Check what is there: `python src/blob_store.py`.
+
+**Safety net:** the first time a file changes on a given day, the app first keeps the old version as
+`data/backup/<date>/<file>` in the same container. To go back:
+
+- everything as it was on a day: `python src/blob_store.py restore 2026-10-15`
+- only the schedule: `python src/blob_store.py restore 2026-10-15 schedule.csv`
+
+Restoring first keeps the current version in `data/backup/before-restore/`, so a restore can be undone too.
+
+Locally, leave both settings out: then your laptop keeps using `data/` and testing never touches the real data.
+Without `SCHEDULE_BLOB_CONTAINER` the app simply uses the local `data/` folder, as before.

@@ -1,8 +1,9 @@
 """Roosterlogica: automatisch inroosteren en controleren van bezetting.
 
-Twee diensten (dag en avond) en drie kanalen (main, app, NL). Per dag en dienst bepalen de
-bezettingsregels hoeveel mensen er per kanaal nodig zijn; belangrijke wedstrijden en events
-krijgen extra bezetting op main en app.
+Drie diensten (Night alleen handmatig, Day, Evening) en drie kanalen (main, app, NL). Per dag en dienst bepalen
+de bezettingsregels hoeveel mensen er per kanaal nodig zijn; wedstrijden en events kunnen extra bezetting krijgen
+(Extra staffing for matches & events). Het echte inplannen gebeurt in optimizer.py; hier staan de regels,
+de controles en de eenvoudige reserveplanner.
 """
 
 from __future__ import annotations
@@ -18,13 +19,13 @@ INTERN = "Intern"  # stagiairs werken altijd ma t/m vr (bij voorkeur overdag), n
 WEEKDAYS_ONLY = {0, 1, 2, 3, 4}
 # Weekend: zo nodig 2 diensten (za én zo), maar na een weekend met 2 is het weekend erna (en ervoor) maximaal 1.
 MAX_WEEKEND_SHIFTS = 2
+MIN_REST_HOURS = 11  # minimale rust tussen twee diensten (zoals de Arbeidstijdenwet)
 
 
 def _prev_week(week: tuple[int, int], delta: int) -> tuple[int, int]:
     monday = date.fromisocalendar(week[0], week[1], 1) + timedelta(weeks=delta)
     return week_key(monday)
 SHIFT_HOURS = 8  # dag- en avonddienst; contracturen / 8 = aantal diensten per week
-SENIOR_LEVELS = {"Senior", "Lead"}
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 # Vaste (vrije) dagen mogen in het Engels of Nederlands ("mon, wed" of "ma, wo").
 _DAY_PREFIXES = [("mo", "ma"), ("tu", "di"), ("we", "wo"), ("th", "do"), ("fr", "vr"), ("sa", "za"), ("su", "zo")]
@@ -135,10 +136,6 @@ def _items(value) -> set[str]:
 STATUS_OK = "OK"
 STATUS_SHORT = "Understaffed"
 STATUS_OVER = "Overstaffed"
-
-
-def is_senior(level: str) -> bool:
-    return level in SENIOR_LEVELS
 
 
 def parse_time(value: str) -> time:
@@ -375,7 +372,7 @@ def generate_schedule(
             "ucl": bool(r.ucl),
             "no_evening": bool(getattr(r, "geen_avond", False)),
         }
-        for r in team[team["actief"] & team["auto"]].itertuples()
+        for r in team[team["actief"] & (team["auto"] | team["nuluren"])].itertuples()
     }
 
     total = Counter()
@@ -541,7 +538,6 @@ def generate_schedule(
 
         # 2. De rest, belangrijkste shifts eerst.
         todo = [s for s in slots if s["naam"] is None and week_key(s["datum"]) == week]
-        shift_order = list(shift_times)
 
         def order(s):
             prio = priority(s["datum"], s["dienst"], s["kanaal"])
@@ -667,7 +663,7 @@ def assignment_problem(
         return f"{name} does not work evenings"
     if day.weekday() in parse_free_days(person.vrije_dagen):
         return f"{name} has {WEEKDAYS[day.weekday()]} off"
-    reasons = [r.reden or (f"{r.deel} off" if getattr(r, "deel", "") else "")
+    reasons = [f"{r.deel} off" if getattr(r, "deel", "") else ""
                for r in absences.itertuples() if r.naam == name and r.van <= day <= r.tot
                and (not getattr(r, "deel", "") or r.deel == dienst)]
     if reasons:

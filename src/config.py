@@ -24,6 +24,8 @@ SECRET_NAMES = {
     # Let op: 'AppProdAzureSql*' werkt NIET op deze server (login failed voor 'Analytics').
     "MATCH_DB_USERNAME": None,
     "MATCH_DB_PASSWORD": None,
+    # Opslag van het rooster: SAS-link die ALLEEN voor de eigen container geldt (zie blob_store.py).
+    "SCHEDULE_BLOB_SAS_URL": None,
 }
 
 
