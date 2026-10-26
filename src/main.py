@@ -111,11 +111,10 @@ CHANNEL_OPTIONS = [sch.CHANNEL_LABELS[c] for c in sch.CHANNELS]
 
 
 # --- periode -------------------------------------------------------------------------
-# Je kiest weken tot 30 weken vooruit (ook over de jaarwisseling). De kalender toont vanaf de gekozen
-# begin-week minstens 12 weken (of meer als je verder plant). Het rooster maak je zelf met de knop.
+# Je kiest weken tot 30 weken vooruit (ook over de jaarwisseling). De kalender toont precies de gekozen weken.
+# Het rooster maak je zelf met de knop.
 
 WEEKS_AHEAD = 30
-WEEKS_SHOWN = 12
 today = date.today()
 first_monday = monday(today) + timedelta(days=7)  # vanaf volgende week (de lopende week staat er al)
 week_starts = [first_monday + timedelta(weeks=i) for i in range(WEEKS_AHEAD)]
@@ -123,13 +122,13 @@ week_name = lambda d: f"Week {d.isocalendar()[1]} - {d.isocalendar()[0]} ({d.day
 
 # Rooster maken: een reeks hele weken (van week … t/m week …, standaard 5 weken); dagen die al voorbij zijn
 # blijven staan en tellen mee voor uren en rusttijd. Zo valt een week nooit half buiten het rooster.
-b0, b0b, b1, mc3 = st.columns([1, 1, 2, 3], vertical_alignment="bottom")
+b0, b0b, b1, b2, mc3 = st.columns([1, 1, 2, 1.2, 2.5], vertical_alignment="bottom")
 first_week = b0.selectbox("From week", week_starts, index=0, format_func=week_name)
 last_options = [w for w in week_starts if w >= first_week]
 last_week = b0b.selectbox("Until week (incl.)", last_options, index=min(4, len(last_options) - 1), format_func=week_name)
 
 start = first_week
-end = max(last_week + timedelta(days=6), start + timedelta(days=WEEKS_SHOWN * 7 - 1))
+end = last_week + timedelta(days=6)  # alleen de gekozen weken
 period = [start + timedelta(days=i) for i in range((end - start).days + 1)]
 weeks = len(period) // 7
 period_key = (start, weeks)
@@ -143,6 +142,9 @@ else:
 if b1.button(f"✨ Make schedule: {month_label}", key="make_weeks", type="primary", use_container_width=True,
              help="Plans every day in these weeks from today on; days that are already past stay as they are."):
     st.session_state["make_month"] = True  # mc3: daar komt zo nodig de vraag of het bestaande rooster weg mag
+if b2.button("🗑 Clear all weeks", key="clear_weeks_btn", use_container_width=True,
+             help="Removes everyone from the chosen weeks (From week – Until week), from today on. Shiftbase is not changed."):
+    st.session_state["clear_weeks"] = True  # eerst bevestigen (in mc3)
 
 # --- wedstrijden laden (nodig voor dagtypes, extra bezetting en de kalender) ---------
 
@@ -547,10 +549,12 @@ calendar["wedstrijden"] = calendar["datum"].map(lambda d: games_per_shift.get(d,
 # --- Rooster -------------------------------------------------------------------------
 
 def neighbours(full: pd.DataFrame) -> pd.DataFrame:
-    """Diensten rond de maand (de rest van de gedeelde weken en de dag ervoor/erna):
-    die tellen mee voor de rusttijd en het aantal diensten per week."""
-    around = (set(period) | {start - timedelta(days=1), end + timedelta(days=1)}) - set(month_days)
-    return full[full["datum"].isin(around)]
+    """Diensten rond de gekozen weken (een week ervoor en erna, plus voorbije dagen): die tellen mee voor de rusttijd,
+    het aantal diensten per week en de weekendregel (na een weekend met 2 diensten is het volgende maximaal 1)."""
+    if not month_days:
+        return full.iloc[0:0]
+    lo, hi = min(month_days) - timedelta(days=7), max(month_days) + timedelta(days=7)
+    return full[(full["datum"] >= lo) & (full["datum"] <= hi) & ~full["datum"].isin(month_days)]
 
 
 def make_month_schedule(full: pd.DataFrame) -> pd.DataFrame:
@@ -590,10 +594,30 @@ if st.session_state.get("make_month"):
         st.session_state["moved"] = (f"Schedule for {month_label} made.", True)
         st.rerun()
 
+# Knop bovenaan: alle gekozen weken leegmaken (vanaf vandaag), na bevestiging. Shiftbase verandert niet.
+if st.session_state.get("clear_weeks"):
+    with mc3:
+        st.warning(f"Remove everyone from {month_label}? Days that are already past stay.")
+        y, n = st.columns(2)
+        if y.button("Yes, clear", type="primary", use_container_width=True):
+            updated = full_roster[~full_roster["datum"].isin(month_days)].reset_index(drop=True)
+            persist("schedule", updated)
+            reset_base("schedule", updated[updated["datum"].isin(period)].reset_index(drop=True))
+            st.session_state["schedule_period"] = period_key
+            st.session_state.pop("clear_weeks")
+            st.session_state["moved"] = (f"{month_label} cleared ({len(full_roster) - len(updated)} shift(s) removed).", True)
+            st.rerun()
+        if n.button("Cancel", key="cancel_clear", use_container_width=True):
+            st.session_state.pop("clear_weeks")
+            st.rerun()
+
 if st.session_state.get("schedule_period") != period_key:
     st.session_state["schedule_period"] = period_key
     reset_base("schedule", full_roster[full_roster["datum"].isin(period)].reset_index(drop=True))
 roster = storage.clean_roster(st.session_state["schedule_base"])
+# Diensten net buiten de getoonde weken (een week ervoor en erna): tellen mee bij de controles (rust, weekendregel).
+nearby = full_roster[(full_roster["datum"] >= start - timedelta(days=10)) & (full_roster["datum"] <= end + timedelta(days=10))
+                     & ~full_roster["datum"].isin(period)]
 
 # --- Wedstrijdkalender (als laatste: dan staat het rooster van deze run er al in) ----
 # Een eigen component, zodat je mensen naar een andere dienst kunt slepen: de browser stuurt
@@ -612,6 +636,12 @@ export default function({ data, parentElement, setTriggerValue }) {
   // Knop naast het weeklabel: die week naar Shiftbase (eerst een overzicht).
   root.querySelectorAll(".mc-sb").forEach((btn) =>
     btn.addEventListener("click", () => setTriggerValue("shiftbase", btn.dataset.sbWeek)));
+  // Clear week: eerst bevestigen, dan iedereen uit die week halen.
+  root.querySelectorAll(".mc-clear").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      if (window.confirm("Remove everyone from this week? Days that are already past stay as they are."))
+        setTriggerValue("clear_week", btn.dataset.clearWeek);
+    }));
 
   root.querySelectorAll(".mc-x").forEach((x) => {
     x.addEventListener("click", (e) => {
@@ -797,6 +827,7 @@ def new_rule_breaks(before: pd.DataFrame, after: pd.DataFrame, include_allowed: 
     lo, hi = min(days) - timedelta(days=10), max(days) + timedelta(days=10)  # hele week + vorig/volgend weekend
 
     def part(df):
+        df = pd.concat([df, nearby], ignore_index=True)  # ook de week ervoor/erna (buiten beeld)
         return df[(df["naam"].isin(names) & (df["datum"] >= lo) & (df["datum"] <= hi)) | df["datum"].isin(days)]
 
     def breaks(df):
@@ -826,17 +857,23 @@ def open_candidates(missing: dict, only: str | None = None) -> dict[str, list[st
     crew = list(zip(here["naam"], here["kanaal"]))
     return {only: [
         n for n in active["naam"]
-        if sch.assignment_problem(n, day, dienst, kanaal, roster[roster["naam"] == n], team, shifts,
+        if sch.assignment_problem(n, day, dienst, kanaal, mine_nearby(n), team, shifts,
                                   unavailable, sch.MIN_REST_HOURS) is None
         and not sch.rule_breaks(n, day, dienst, kanaal, crew, planning_rules)
         and not adds_problem(n, day, dienst, kanaal)
     ]}
 
 
+def mine_nearby(name: str) -> pd.DataFrame:
+    """Diensten van één persoon in beeld én net erbuiten (voor rust en dubbele diensten)."""
+    both = pd.concat([roster, nearby], ignore_index=True)
+    return both[both["naam"] == name]
+
+
 def explain_hours(name: str, days: list[date]) -> str:
     """Waarom heeft `name` op de vrije dagen van deze week geen dienst? (tooltip in de urenkolom)"""
     channels = sch.channels_of(team.set_index("naam")["kanalen"].get(name, "")) or sch.CHANNELS
-    own = roster[roster["naam"] == name]
+    own = mine_nearby(name)
     worked = set(own["datum"])
     lines = []
     for d in days:
@@ -894,7 +931,8 @@ def apply_move(move: dict) -> tuple[str, bool]:
     if move.get("to_date"):
         day = date.fromisoformat(move["to_date"])
         channel = move.get("channel") or pick_channel(name, day, move["to_shift"])
-        problem = sch.assignment_problem(name, day, move["to_shift"], channel, updated, team, shifts,
+        problem = sch.assignment_problem(name, day, move["to_shift"], channel,
+                                         pd.concat([updated, nearby], ignore_index=True), team, shifts,
                                          unavailable, sch.MIN_REST_HOURS)
         if problem:
             return f"Not possible: {problem}", False
@@ -1060,7 +1098,7 @@ with t_matches:
                                       "open_key": st.session_state.pop("open_request", None)},
                                 key="match_calendar",
                                 on_move_change=lambda: None, on_shiftbase_change=lambda: None,
-                                on_open_request_change=lambda: None)
+                                on_open_request_change=lambda: None, on_clear_week_change=lambda: None)
         if result.move:
             st.session_state["moved"] = apply_move(result.move)
             st.rerun()
@@ -1069,6 +1107,16 @@ with t_matches:
             st.rerun()
         if result.shiftbase:
             shiftbase_week(date.fromisoformat(result.shiftbase))
+        if result.clear_week:  # Clear week: alleen vandaag en later, wat al voorbij is blijft staan
+            week = [date.fromisoformat(result.clear_week) + timedelta(days=i) for i in range(7)]
+            cleared = [d for d in week if d >= today]
+            full = storage.load_roster()
+            updated = full[~full["datum"].isin(cleared)].reset_index(drop=True)
+            persist("schedule", updated)
+            reset_base("schedule", updated[updated["datum"].isin(period)].reset_index(drop=True))
+            st.session_state["moved"] = (f"Week {week[0].isocalendar()[1]} cleared "
+                                         f"({len(full) - len(updated)} shift(s) removed).", True)
+            st.rerun()
 
 # --- Shiftbase: wat daar nu staat, in dezelfde kalender (alleen bekijken) -------------
 
