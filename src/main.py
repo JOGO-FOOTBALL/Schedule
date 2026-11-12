@@ -204,6 +204,7 @@ with t_team:
     team_view = storage.clean_team(base("employees", storage.load_team)).assign(
         kanalen=lambda df: df["kanalen"].map(lambda v: [sch.CHANNEL_LABELS[c] for c in sch.channels_of(v)]),
         avond_vanaf=lambda df: pd.to_datetime(df["avond_vanaf"], errors="coerce").dt.date,  # datumkiezer in de tabel
+        seniority=lambda df: df["seniority"] == sch.INTERN,  # vinkje Intern (clean_team maakt er weer "Intern" of "" van)
     )
     team = st.data_editor(
         team_view,
@@ -245,9 +246,8 @@ with t_team:
             "vaste_dagen": st.column_config.TextColumn("Always on"),
             "ucl": st.column_config.CheckboxColumn("UCL nights", default=False),
             "vrije_dagen": st.column_config.TextColumn("Fixed days off"),
-            "seniority": st.column_config.SelectboxColumn(
-                "Role", options=sch.SENIORITY_LEVELS, default="Medior",
-                format_func=lambda v: "Intern (stagiair)" if v == sch.INTERN else v,
+            "seniority": st.column_config.CheckboxColumn(
+                "Intern", default=False,
                 help="Intern (stagiair): always Mon–Fri day shifts, never weekends, never alone on their channel.",
             ),
         },
@@ -657,14 +657,26 @@ export default function({ data, parentElement, setTriggerValue }) {
   const openHolePicker = (hole) => {
       const row = hole.closest("[data-drop-date]");
       const key = `${row.dataset.dropDate}|${row.dataset.dropShift}|${hole.dataset.openChannel}`;
-      const names = (data.open_candidates || {})[key] || [];
+      const found = (data.open_candidates || {})[key] || {};
+      const names = found.ok || [], blocked = found.blocked || [];
+      const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
       const select = document.createElement("select");
       select.className = "mc-picker";
-      select.innerHTML = names.length
-        ? '<option value="">Choose who…</option>' + names.map((n) => `<option value="${n}">${n}</option>`).join("")
-        : '<option value="">Nobody can work this by the rules</option>';
+      // Wie kan wél (kiesbaar), en daaronder per medewerker waarom niet (grijs, niet kiesbaar).
+      select.innerHTML = (names.length
+        ? '<option value="">Choose who…</option>' + names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("")
+        : '<option value="">Nobody can work this by the rules</option>')
+        + (blocked.length ? '<optgroup label="Cannot work this, because:">'
+          + blocked.map(([n, why], i) => `<option value="force:${i}"${why.startsWith("already works") ? " disabled" : ""}>`
+            + `${esc(n)}: ${esc(why)}</option>`).join("") + "</optgroup>" : "");
       select.addEventListener("change", () => {
-        if (select.value) setTriggerValue("move", { name: select.value, from_date: null, from_shift: null,
+        let name = select.value, force = false;
+        if (name.startsWith("force:")) {  // mag niet volgens de regels: alleen met de hand, na bevestiging
+          const [n, why] = blocked[Number(name.slice(6))];
+          if (!window.confirm(`${n} can't work this by the rules: ${why}.\n\nSchedule ${n} anyway?`)) { select.value = ""; return; }
+          name = n; force = true;
+        }
+        if (name) setTriggerValue("move", { name, force, from_date: null, from_shift: null,
           channel: hole.dataset.openChannel, to_date: row.dataset.dropDate, to_shift: row.dataset.dropShift });
       });
       select.addEventListener("keydown", (e) => { if (e.key === "Escape") select.replaceWith(hole); });
@@ -838,16 +850,18 @@ def new_rule_breaks(before: pd.DataFrame, after: pd.DataFrame, include_allowed: 
     return new if include_allowed else [p for p in new if not manual_ok(p)]
 
 
-def open_candidates(missing: dict, only: str | None = None) -> dict[str, list[str]]:
-    """Per open plek ("datum|dienst|kanaal") wie die dienst volgens alle regels echt kan doen.
+def open_candidates(missing: dict, only: str | None = None) -> dict[str, dict]:
+    """Per open plek ("datum|dienst|kanaal") wie die dienst volgens alle regels echt kan doen ("ok"),
+    en per andere medewerker op dat kanaal waarom niet ("blocked": [naam, reden]).
     Alleen voor de plek waarop net geklikt is (`only`): alles uitrekenen maakt elke klik traag."""
     if not only:
         return {}
-    def adds_problem(name, day, dienst, kanaal) -> bool:
+    def adds_problem(name, day, dienst, kanaal) -> str | None:
         # Snel: alleen de diensten van die persoon en van die dag bekijken (niet het hele rooster).
         part = roster[(roster["naam"] == name) | (roster["datum"] == day)]
         new_row = pd.DataFrame([{"datum": day, "dienst": dienst, "kanaal": kanaal, "naam": name}])
-        return bool(new_rule_breaks(part, pd.concat([part, new_row], ignore_index=True)))
+        broken = new_rule_breaks(part, pd.concat([part, new_row], ignore_index=True))
+        return broken[0] if broken else None
 
     day, dienst, kanaal = only.split("|")
     day = date.fromisoformat(day)
@@ -855,13 +869,24 @@ def open_candidates(missing: dict, only: str | None = None) -> dict[str, list[st
         return {}
     here = roster[(roster["datum"] == day) & (roster["dienst"] == dienst)]
     crew = list(zip(here["naam"], here["kanaal"]))
-    return {only: [
-        n for n in active["naam"]
-        if sch.assignment_problem(n, day, dienst, kanaal, mine_nearby(n), team, shifts,
-                                  unavailable, sch.MIN_REST_HOURS) is None
-        and not sch.rule_breaks(n, day, dienst, kanaal, crew, planning_rules)
-        and not adds_problem(n, day, dienst, kanaal)
-    ]}
+    channels = team.set_index("naam")["kanalen"]
+    ok, blocked = [], []
+    for n in active["naam"]:
+        if kanaal not in (sch.channels_of(channels.get(n, "")) or sch.CHANNELS):
+            continue  # werkt niet op dit kanaal: niet de moeite van uitleggen
+        if n in set(here["naam"]):
+            blocked.append([n, f"already works this {dienst.lower()} shift"])
+            continue
+        problem = sch.assignment_problem(n, day, dienst, kanaal, mine_nearby(n), team, shifts,
+                                         unavailable, sch.MIN_REST_HOURS)
+        if problem is None:
+            broken = sch.rule_breaks(n, day, dienst, kanaal, crew, planning_rules)
+            problem = broken[0] if broken else adds_problem(n, day, dienst, kanaal)
+        if problem is None:
+            ok.append(n)
+        else:
+            blocked.append([n, problem.replace(f"{n} ", "", 1)])
+    return {only: {"ok": ok, "blocked": blocked}}
 
 
 def mine_nearby(name: str) -> pd.DataFrame:
@@ -904,6 +929,7 @@ def apply_move(move: dict) -> tuple[str, bool]:
     """
     updated = roster.copy()
     name = move["name"]
+    problem = None
     if move.get("new_channel"):
         day = date.fromisoformat(move["from_date"])
         row = ((updated["datum"] == day) & (updated["dienst"] == move["from_shift"])
@@ -934,8 +960,10 @@ def apply_move(move: dict) -> tuple[str, bool]:
         problem = sch.assignment_problem(name, day, move["to_shift"], channel,
                                          pd.concat([updated, nearby], ignore_index=True), team, shifts,
                                          unavailable, sch.MIN_REST_HOURS)
-        if problem:
+        if problem and not move.get("force"):
             return f"Not possible: {problem}", False
+        if move.get("force") and ((updated["datum"] == day) & (updated["naam"] == name)).any():
+            return f"Not possible: {name} already works on {day_label(day)} (two shifts on one day, also not when forced)", False
         updated = pd.concat([updated, pd.DataFrame([{
             "datum": day, "dienst": move["to_shift"], "kanaal": channel, "naam": name,
         }])], ignore_index=True)
@@ -945,10 +973,12 @@ def apply_move(move: dict) -> tuple[str, bool]:
     updated = storage.clean_roster(updated.drop_duplicates())
     new = new_rule_breaks(roster, updated, include_allowed=True)
     blocking = [p for p in new if not manual_ok(p)]
-    if blocking:
+    if blocking and not move.get("force"):
         return f"Not possible: {blocking[0]}", False
     persist("schedule", storage.clean_roster(merge_range(storage.load_roster(), updated, period)))
     reset_base("schedule", updated)
+    if move.get("force") and (problem or blocking):  # met de hand doorgezet: laat zien welke regel het breekt
+        return f"{message} — forced, breaks: {(problem or blocking[0]).replace(f'{name} ', '', 1)}", True
     if new:  # mag wel, maar laat zien welke planregel je doorbreekt
         return f"{message} — note: {new[0].split(' (')[0].lower()}", True
     return message, True
@@ -972,7 +1002,8 @@ def shiftbase_week(week_start: date) -> None:
     planned = planned[planned["datum"].isin(days)]
     try:
         sb = shiftbase.preview(planned, {n: i for n, i in zip(team["naam"], team["shiftbase_id"]) if i},
-                               {r.dienst: (r.start, r.eind) for r in shifts.itertuples()}, days[0], days[-1])
+                               {r.dienst: (r.start, r.eind) for r in shifts.itertuples()}, days[0], days[-1],
+                               late=sch.late_days(storage.load_roster()))
     except Exception as exc:  # geen sleutel, geen verbinding, ...
         st.error(f"Could not read Shiftbase: {type(exc).__name__}: {exc}")
         return
@@ -1064,6 +1095,20 @@ with t_matches:
         if "moved" in st.session_state:
             message, ok = st.session_state.pop("moved")
             st.toast(message, icon="✅" if ok else "⛔")
+        # Slepen of + mocht niet volgens de regels: met de hand toch doorzetten (na een klik).
+        offer = st.session_state.get("force_offer")
+        if offer:
+            move, why = offer
+            w1, w2, w3 = st.columns([6, 1.3, 1], vertical_alignment="center")
+            w1.warning(f"{why}. Schedule {move['name']} on {day_label(date.fromisoformat(move['to_date']))} "
+                       f"{move['to_shift']} anyway?")
+            if w2.button("Schedule anyway", type="primary", use_container_width=True, key="force_yes"):
+                st.session_state.pop("force_offer")
+                st.session_state["moved"] = apply_move({**move, "force": True})
+                st.rerun()
+            if w3.button("Cancel", use_container_width=True, key="force_no"):
+                st.session_state.pop("force_offer")
+                st.rerun()
         # Lege plekken in wat al gepland is (week én maand met een rooster): rode "open"-chip in de kalender.
         missing = {}
         if not roster.empty:
@@ -1085,6 +1130,7 @@ with t_matches:
             games, period, dict(zip(calendar["datum"], calendar["dagtype"])), urls,
             now=pd.Timestamp.now(tz=matches.LOCAL_TZ).to_pydatetime(), clubs=clubs, league_urls=league_urls,
             events=events_by_day, roster=roster, flags=flags, missing=missing, explain=explain_hours,
+            late=sch.late_days(pd.concat([nearby, roster], ignore_index=True)),  # dagdienst na avonddienst: 10–18
             # Alleen wie meedoet in het rooster (Auto schedule aan): niet bijv. Tim/Rogier (Auto schedule uit).
             contracts={n: (0 if z else c) for n, c, z, a in
                        zip(active["naam"], active["contracturen"], active["nuluren"], active["auto"]) if a},
@@ -1100,7 +1146,12 @@ with t_matches:
                                 on_move_change=lambda: None, on_shiftbase_change=lambda: None,
                                 on_open_request_change=lambda: None, on_clear_week_change=lambda: None)
         if result.move:
-            st.session_state["moved"] = apply_move(result.move)
+            message, ok = apply_move(result.move)
+            st.session_state["moved"] = (message, ok)
+            st.session_state.pop("force_offer", None)
+            if not ok and message.startswith("Not possible") and result.move.get("to_date") \
+                    and not result.move.get("new_channel") and not result.move.get("force"):
+                st.session_state["force_offer"] = (dict(result.move), message)  # knop "Schedule anyway"
             st.rerun()
         if result.open_request:  # op een open plek geklikt: kandidaten voor alleen die plek uitrekenen
             st.session_state["open_request"] = result.open_request

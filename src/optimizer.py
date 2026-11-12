@@ -21,6 +21,7 @@ import scheduler as sch
 
 # Gewichten (hoger = belangrijker).
 W_SHORT = {0: 1000, 1: 900, 2: 600, 3: 800}  # open plek: NL-sleuteldienst, weekendavond, weekenddag, doordeweeks
+W_LATE_DAY = 300  # dagdienst direct na een avonddienst (10:00–18:00): liever niet, alleen waar nodig
 W_MUST = 700  # vaste afspraak niet gehaald (Always works, vaste dagen, UCL-persoon)
 W_ZERO = 5000  # afgesproken nul-urendag niet ingepland: zwaarder dan alles, alleen een harde regel kan het tegenhouden
 W_CONTRACT = 120  # per dienst onder de contracturen
@@ -28,7 +29,10 @@ W_WEEK_MIN = 40  # geen doordeweekse avond / geen weekenddienst die week
 W_WEEKEND_EXTRA = 200  # meer mensen in het weekend dan nodig
 W_SECOND_WEEKEND = 20  # tweede weekenddienst in een week
 W_REPEAT = 10  # zelfde weekenddienst (bijv. zaterdagavond) twee weken achter elkaar
-W_PREF = 15  # dienst tegen de voorkeur in
+W_PREF = 40  # dienst tegen de voorkeur in
+W_EVENINGS = 60  # per avond boven het maximum in een week; zwaarder dan W_PREF, zodat er altijd wat afwisseling is
+MAX_EVENINGS = 3  # liever niet meer avonden per week
+MAX_EVENINGS_PREF = 4  # idem, voor wie voorkeur voor avond heeft (bijv. Jonathan)
 TIME_LIMIT = 25  # seconden
 
 
@@ -67,6 +71,7 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
     not_alone = {(r.naam, r.waarde) for r in rules_df.itertuples() if r.regel == sch.RULE_NOT_ALONE}
     together = {r.naam for r in rules_df.itertuples() if r.regel == sch.RULE_EVENING_TOGETHER}
     never_with = [(r.naam, r.waarde) for r in rules_df.itertuples() if r.regel == sch.RULE_NOT_WITH]
+    late_ok = {n for n in names if sch.late_day_ok(n, rules_df)}
 
     def statically_ok(n, d, s, k) -> bool:
         p = info[n]
@@ -140,10 +145,22 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
                 nxt = d + timedelta(days=1)
                 for s2 in plan_shifts:
                     if (n, nxt, s2) in on_shift and clash(w, windows[nxt, s2]):
-                        m.Add(on_shift[n, d, s] + on_shift[n, nxt, s2] <= 1)
+                        if sch.is_late_day(w[1], windows[nxt, s2][0]):  # mag als late dagdienst, maar liever niet
+                            if n in late_ok:
+                                continue  # vindt die persoon geen bezwaar (regel Late day shift OK)
+                            late = m.NewBoolVar(f"late_{n}_{nxt}")
+                            m.Add(on_shift[n, d, s] + on_shift[n, nxt, s2] <= 1 + late)
+                            terms.append(W_LATE_DAY * late)
+                        else:
+                            m.Add(on_shift[n, d, s] + on_shift[n, nxt, s2] <= 1)
                 for cd, cs in ctx_by_person[n]:
-                    if abs((cd - d).days) <= 1 and clash(w, sch.shift_window(cd, *shift_times[cs])):
-                        m.Add(on_shift[n, d, s] == 0)
+                    cw = sch.shift_window(cd, *shift_times[cs])
+                    if abs((cd - d).days) <= 1 and clash(w, cw):
+                        if sch.is_late_day(cw[1], w[0]) or sch.is_late_day(w[1], cw[0]):
+                            if n not in late_ok:
+                                terms.append(W_LATE_DAY * on_shift[n, d, s])
+                        else:
+                            m.Add(on_shift[n, d, s] == 0)
 
     def weekend_vars(n, week):
         return [on_shift[n, d, s] for d in days for s in plan_shifts
@@ -267,6 +284,13 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
                     no_ev = m.NewBoolVar(f"noev_{n}_{week}")
                     m.Add(sum(ev) + no_ev >= 1)
                     terms.append(W_WEEK_MIN * no_ev)
+            # Afwisseling: liever niet meer dan 3 avonden per week (4 voor wie voorkeur voor avond heeft).
+            all_ev = [v for (nn, d, s), v in on_shift.items() if nn == n and s == sch.EVENING and sch.week_key(d) == week]
+            most = MAX_EVENINGS_PREF if sch.preferred_shift(n, wdays[0], rules_df) == sch.EVENING else MAX_EVENINGS
+            if len(all_ev) > most:
+                many = m.NewIntVar(0, len(all_ev), f"evenings_{n}_{week}")
+                m.Add(many >= sum(all_ev) - most)
+                terms.append(W_EVENINGS * many)
         for (nn, d, s), v in on_shift.items():
             if nn != n:
                 continue

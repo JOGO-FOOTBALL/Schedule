@@ -14,12 +14,14 @@ from datetime import date, datetime, time, timedelta
 
 import pandas as pd
 
-SENIORITY_LEVELS = ["Intern", "Junior", "Medior", "Senior", "Lead"]
 INTERN = "Intern"  # stagiairs werken altijd ma t/m vr (bij voorkeur overdag), nooit in het weekend
 WEEKDAYS_ONLY = {0, 1, 2, 3, 4}
 # Weekend: zo nodig 2 diensten (za én zo), maar na een weekend met 2 is het weekend erna (en ervoor) maximaal 1.
 MAX_WEEKEND_SHIFTS = 2
 MIN_REST_HOURS = 11  # minimale rust tussen twee diensten (zoals de Arbeidstijdenwet)
+# Uitzondering: een dagdienst direct na een avonddienst mag, maar begint dan later (10:00–18:00, 10 uur rust).
+# De planner doet dat alleen waar nodig; in het rooster blijft het gewoon "Day".
+LATE_DAY = ("10:00", "18:00")
 
 
 def _prev_week(week: tuple[int, int], delta: int) -> tuple[int, int]:
@@ -55,6 +57,7 @@ RULE_ONLY_DAYS = "Only on days"  # waarde: dagen, bijv. "mon, tue, wed, thu, fri
 RULE_NEVER_DAYS = "Never on days"  # waarde: dagen, bijv. "sun"
 RULE_PREFERS = "Prefers shift"  # voorkeur (geen harde regel): "Evening", of voor bepaalde dagen "Day: mon, fri"
 RULE_ALWAYS = "Always works"  # harde regel: "Day: mon, fri" = op ma en vr altijd de dagdienst (bijv. kantoor)
+RULE_LATE_OK = "Late day shift OK"  # waarde: yes; dagdienst 10:00–18:00 na een avond is voor deze persoon geen bezwaar
 # Nuluren (tab Zero hours): intern als regel met waarde "2026-10-12:Day;2026-10-14:Any". Alleen op die dagen
 # (en dan ook echt), nooit aanvullen tot contracturen. Niet zelf in Person rules te kiezen.
 RULE_ZERO = "Zero hours"
@@ -63,7 +66,7 @@ RULE_EVENING_FROM = "Evenings from"  # waarde: datum (YYYY-MM-DD)
 RULE_EVENING_TOGETHER = "Evenings only together"  # 's avonds nog iemand op hetzelfde kanaal
 ANY_SHIFT = "Any"
 RULE_TYPES = [RULE_ALWAYS, RULE_PREFERS, RULE_ONLY_CHANNEL, RULE_ONLY_SHIFT, RULE_ONLY_DAYS, RULE_NEVER_DAYS,
-              RULE_NOT_ALONE, RULE_NO_SHIFT, RULE_NOT_WITH]
+              RULE_NOT_ALONE, RULE_NO_SHIFT, RULE_NOT_WITH, RULE_LATE_OK]
 # Zo vul je de waarde in, per soort regel (uitleg in de app).
 RULE_VALUES = {
     RULE_ALWAYS: "shift: days, e.g. Day: mon, fri (always scheduled in that shift on those days)",
@@ -75,7 +78,14 @@ RULE_VALUES = {
     RULE_NOT_ALONE: "a channel: main, app, nl",
     RULE_NO_SHIFT: "a shift, or a shift on some days: Night · Day: sat · Evening: fri",
     RULE_NOT_WITH: "another person",
+    RULE_LATE_OK: "yes (a day shift 10:00–18:00 right after an evening is fine for this person)",
 }
+
+
+def late_day_ok(name: str, person_rules) -> bool:
+    """Vindt `name` een late dagdienst (10:00–18:00 na een avond) geen probleem? (regel Late day shift OK)"""
+    return any(r.naam == name and r.regel == RULE_LATE_OK and str(r.waarde).strip().lower() not in ("no", "nee", "0")
+               for r in _rows(person_rules))
 
 
 def preferred_shift(name: str, day: date, person_rules: pd.DataFrame | None) -> str | None:
@@ -229,15 +239,27 @@ def _is_absent(name: str, day: date, absence_map, dienst: str | None = None) -> 
                for start, end, part in absence_map.get(name, []))
 
 
+def is_late_day(prev_end: datetime, next_start: datetime) -> bool:
+    """Avonddienst tot middernacht, de ochtend erna de dagdienst van 09:00: mag, als late dagdienst (10:00–18:00)."""
+    return prev_end.time() == time(0, 0) and next_start - prev_end == timedelta(hours=9)
+
+
+def late_days(roster: pd.DataFrame) -> set[tuple[date, str]]:
+    """(datum, naam) van dagdiensten direct na een avonddienst: die lopen van 10:00 tot 18:00."""
+    evenings = {(r.datum, r.naam) for r in roster.itertuples() if r.dienst == EVENING}
+    return {(r.datum, r.naam) for r in roster.itertuples()
+            if r.dienst == DAY and (r.datum - timedelta(days=1), r.naam) in evenings}
+
+
 def _rest_ok(windows, start: datetime, end: datetime, min_rest: timedelta) -> bool:
     for s, e in windows:
         if start >= e:
-            gap = start - e
+            gap, late = start - e, is_late_day(e, start)
         elif s >= end:
-            gap = s - end
+            gap, late = s - end, is_late_day(end, s)
         else:
             return False  # overlap
-        if gap < min_rest:
+        if gap < min_rest and not late:
             return False
     return True
 
@@ -786,7 +808,7 @@ def check_conflicts(
         )
         for (prev_window, _), (window, row) in zip(timed, timed[1:]):
             gap = window[0] - prev_window[1]
-            if timedelta(0) <= gap < min_rest:
+            if timedelta(0) <= gap < min_rest and not is_late_day(prev_window[1], window[0]):
                 add(row, f"Only {gap.total_seconds() / 3600:.0f} hours rest after previous shift")
 
     week_start_day = None  # maandag van de week die gecontroleerd wordt (zie hieronder)

@@ -209,7 +209,8 @@ def payload(datum: date, dienst: str, kanaal: str, user_id: str, start: str, end
     }}
 
 
-def preview(planned, ids: dict[str, str], shift_times: dict[str, tuple[str, str]], min_date: date, max_date: date):
+def preview(planned, ids: dict[str, str], shift_times: dict[str, tuple[str, str]], min_date: date, max_date: date,
+            late: set | None = None):
     """Vergelijk ons rooster met Shiftbase. Geeft per regel: wat we zouden sturen en of het er al staat.
 
     Er wordt NIETS verstuurd."""
@@ -223,6 +224,8 @@ def preview(planned, ids: dict[str, str], shift_times: dict[str, tuple[str, str]
     for r in planned.sort_values(["datum", "dienst"]).itertuples():
         uid = ids.get(r.naam, "")
         start, end = shift_times.get(r.dienst, ("", ""))
+        if (r.datum, r.naam) in (late or set()):  # dagdienst direct na een avonddienst: 10:00–18:00
+            start, end = "10:00", "18:00"
         ours.add((uid, r.datum.isoformat()))
         now = by_key.get((uid, r.datum.isoformat()))
         if not uid:
