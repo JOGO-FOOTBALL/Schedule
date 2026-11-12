@@ -80,7 +80,7 @@ This is where the app stores everything you enter in it. Each tab has its own fi
 
 | File | Contents |
 |---|---|
-| `employees.csv` | The team: channels, contract hours, Shiftbase ID, fixed days off, role (e.g. intern), ... |
+| `employees.csv` | The team: channels, contract hours, Shiftbase ID, fixed days off, intern yes/no, ... |
 | `schedule.csv` | **The schedule**: per day who works which shift on which channel. |
 | `staffing.csv` | How many people are needed per day type, shift and channel. |
 | `match_staffing.csv` | Extra staffing for matches and events. |
