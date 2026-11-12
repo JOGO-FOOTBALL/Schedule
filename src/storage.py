@@ -34,7 +34,7 @@ SHIFTBASE_IDS = {
 DEFAULT_TEAM = pd.DataFrame(
     [
         {
-            "naam": n.rstrip("*"), "shiftbase_id": SHIFTBASE_IDS.get(n.rstrip("*"), ""), "seniority": "Intern" if n.rstrip("*") == "Maybel" else "Medior", "kanalen": _ONLY.get(n, "main, app, nl"), "auto": n not in _MANUAL_ONLY, "geen_avond": False, "avond_vanaf": "", "avond_samen": False, "nuluren": False,
+            "naam": n.rstrip("*"), "shiftbase_id": SHIFTBASE_IDS.get(n.rstrip("*"), ""), "seniority": "Intern" if n.rstrip("*") == "Maybel" else "", "kanalen": _ONLY.get(n, "main, app, nl"), "auto": n not in _MANUAL_ONLY, "geen_avond": False, "avond_vanaf": "", "avond_samen": False, "nuluren": False,
             "contracturen": 16 if n == "Thijn" else 40, "max_per_week": 5, "vrije_dagen": "",
             # Francisco werkt altijd 16:00 - 00:00 en steevast op vrijdag; Rogier staat bij UCL op main.
             "vaste_dienst": "Evening" if n == "Francisco" else "", "vaste_dagen": "fri" if n == "Francisco" else "",
@@ -149,7 +149,8 @@ def clean_team(df: pd.DataFrame) -> pd.DataFrame:
     df["naam"] = _text(df["naam"])
     df["shiftbase_id"] = _text(df["shiftbase_id"]).str.replace(r"\.0$", "", regex=True)
     df["shiftbase_id"] = df["shiftbase_id"].where(df["shiftbase_id"] != "", df["naam"].map(SHIFTBASE_IDS).fillna(""))
-    df["seniority"] = _text(df["seniority"]).replace("", "Medior")
+    # Alleen "Intern" doet iets (stagiair-regels); de oude rollen (Junior, Medior, ...) worden leeg.
+    df["seniority"] = df["seniority"].map(lambda v: "Intern" if str(v).strip().lower() in ("intern", "true") else "")
     df["kanalen"] = df["kanalen"].map(lambda v: ", ".join(channel_list(v)))
     df["contracturen"] = _ints(df["contracturen"], 0)
     df["max_per_week"] = _ints(df["max_per_week"], 5)
