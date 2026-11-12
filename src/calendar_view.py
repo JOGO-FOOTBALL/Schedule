@@ -278,7 +278,7 @@ CHANNEL_NAMES = {"main": "Main", "app": "App", "nl": "NL"}
 SHORT = {"main": "M", "app": "A", "nl": "NL"}
 
 
-def _chips(group: pd.DataFrame | None, flags: dict | None = None) -> str:
+def _chips(group: pd.DataFrame | None, flags: dict | None = None, late: set | None = None) -> str:
     """Namen met een label voor het kanaal, in de volgorde main, app, NL. Te verslepen naar een andere dienst."""
     if group is None or group.empty:
         return ""
@@ -290,7 +290,8 @@ def _chips(group: pd.DataFrame | None, flags: dict | None = None) -> str:
         f'draggable="true" data-name="{escape(r.naam)}" data-date="{r.datum.isoformat()}" '
         f'data-shift="{escape(r.dienst)}" data-channel="{escape(r.kanaal)}">'
         + (f'<i>{SHORT[r.kanaal]}</i>' if r.kanaal in SHORT else "")  # geen kanaal (Shiftbase-tab): alleen de naam
-        + f'{escape(r.naam)}<b class="mc-x" title="Remove from this shift">×</b></span>'
+        + escape(r.naam) + (" 10–18" if (r.datum, r.naam) in (late or set()) else "")  # late dagdienst
+        + '<b class="mc-x" title="Remove from this shift">×</b></span>'
         for r in sorted(group.itertuples(), key=lambda r: (order.get(r.kanaal, 9), r.naam))
     )
 
@@ -303,7 +304,7 @@ def game_shift(kickoff: str) -> str:
 
 
 def _shift_rows(day: date, day_roster: pd.DataFrame | None, cards: list[tuple[str, str]],
-                flags: dict | None = None, missing: dict | None = None) -> str:
+                flags: dict | None = None, missing: dict | None = None, late: set | None = None) -> str:
     """Per dienst een rij: links de mensen, rechts de wedstrijden die in die dienst vallen."""
     crew = dict(tuple(day_roster.groupby("dienst"))) if day_roster is not None else {}
     rows = []
@@ -315,7 +316,7 @@ def _shift_rows(day: date, day_roster: pd.DataFrame | None, cards: list[tuple[st
         # Lege plekken (niemand beschikbaar volgens de regels): rode chip, bijv. "NL open".
         holes = "".join(
             f'<span class="mc-chip mc-open c-{escape(k)}" data-open-channel="{escape(k)}" '
-            f'title="{n} more needed on {escape(CHANNEL_NAMES.get(k, k))} ({escape(why)}); nobody else can work it by the rules. Click to fill it in.">'
+            f'title="{n} more needed on {escape(CHANNEL_NAMES.get(k, k))} ({escape(why)}); nobody else can work it by the rules. Click to see who can, and why the others cannot.">'
             f'<i>{SHORT.get(k, "?")}</i>open{f" ×{n}" if n > 1 else ""}</span>'
             for k, (n, why) in sorted((missing or {}).get((day, shift), {}).items(),
                                       key=lambda kv: list(CHANNEL_NAMES).index(kv[0]))
@@ -323,7 +324,7 @@ def _shift_rows(day: date, day_roster: pd.DataFrame | None, cards: list[tuple[st
         rows.append(
             f'<div class="mc-shift"{drop}><div class="mc-shift-crew">'
             f'<span class="mc-crew-shift">{escape(shift)}</span>'
-            f'{_chips(crew.get(shift), flags)}{holes}{add}</div><div class="mc-shift-games">{games_html}</div></div>'
+            f'{_chips(crew.get(shift), flags, late)}{holes}{add}</div><div class="mc-shift-games">{games_html}</div></div>'
         )
     return "".join(rows)
 
@@ -386,7 +387,8 @@ def render(games: pd.DataFrame, period: list[date], day_types: dict[date, str],
            events: dict[date, list[str]] | None = None, roster: pd.DataFrame | None = None,
            contracts: dict[str, int] | None = None,
            shift_hours: dict[str, float] | None = None, away: dict[str, set[date]] | None = None,
-           flags: dict | None = None, missing: dict | None = None, explain=None, readonly: bool = False) -> str:
+           flags: dict | None = None, missing: dict | None = None, explain=None, readonly: bool = False,
+           late: set | None = None) -> str:
     """`readonly`: alleen bekijken (bijv. wat in Shiftbase staat): geen ×, + of Send to Shiftbase."""
     crew_by_day = {d: g for d, g in roster.groupby("datum")} if roster is not None and not roster.empty else {}
     if games.empty and roster is None and not any(d in (events or {}) for d in period):
@@ -464,7 +466,7 @@ def render(games: pd.DataFrame, period: list[date], day_types: dict[date, str],
                 f'<span class="mc-dow">{DAYS[d.weekday()]}</span>'
                 f'<span class="mc-date">{d.day:02d}</span></div>{day_type}'
 
-                + (_shift_rows(d, day_roster, [(game_shift(g.tijd), _card(g, urls, extra=id(g) not in top)) for g in ordered], flags, missing)
+                + (_shift_rows(d, day_roster, [(game_shift(g.tijd), _card(g, urls, extra=id(g) not in top)) for g in ordered], flags, missing, late)
                    if crew else "".join(_card(g, urls, extra=id(g) not in top) for g in ordered))
                 + more + "</div>"
             )
