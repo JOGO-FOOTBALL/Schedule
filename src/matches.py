@@ -127,6 +127,14 @@ def game_popularity(g, clubs: list[str]) -> int:
     return min((r for r in ranks if r is not None), default=len(clubs))
 
 
+def game_weight(g, clubs: list[str], top: int) -> int:
+    """Hoe zwaar een wedstrijd telt bij het aanvullen tot contracturen: 1, +2 met een topclub, +3 als het twee
+    topclubs tegen elkaar zijn (bijv. El Clásico). Topclub = top `top` van de clublijst."""
+    ranks = [popularity(team, clubs) for team in (g.HomeTeam, g.AwayTeam)]
+    top_teams = sum(1 for r in ranks if r is not None and r < top)
+    return 1 + (2 if top_teams else 0) + (3 if top_teams == 2 else 0)
+
+
 def big_matches(df: pd.DataFrame, clubs: list[str], top: int) -> list:
     """Wedstrijden tussen twee clubs uit de top `top` van de clublijst (bijv. El Clásico)."""
     def in_top(team: str) -> bool:
