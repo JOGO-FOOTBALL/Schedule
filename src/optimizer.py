@@ -4,8 +4,8 @@ Alle weken worden in één keer bekeken, zodat het ene weekend niet de restjes v
 Harde regels (één dienst per dag, rusttijd, max per week, weekendregel, kanalen, vrije dagen, persoonsregels)
 gelden altijd; de rest weegt mee in een score:
 
-    afgesproken nul-urendagen  >  open plekken  >>  vaste afspraken (altijd werken, UCL)  >  contracturen  >  weekminimum
-    >  voorkeuren / afwisseling / extra mensen waar de wedstrijden zijn
+    nul-urendagen / Specific dates  >  open plekken  >  vaste afspraken (altijd werken, UCL)  >  contracturen
+    >  late dagdienst  >  extra mensen in het weekend  >  weekminimum  >  voorkeuren / afwisseling
 
 Geeft None terug als OR-Tools er niet is of geen oplossing vindt; dan gebruikt scheduler.py de oude planner.
 """
@@ -24,9 +24,12 @@ W_SHORT = {0: 1000, 1: 900, 2: 600, 3: 800}  # open plek: NL-sleuteldienst, week
 W_LATE_DAY = 300  # dagdienst direct na een avonddienst (10:00–18:00): liever niet, alleen waar nodig
 W_MUST = 700  # vaste afspraak niet gehaald (Always works, vaste dagen, UCL-persoon)
 W_ZERO = 5000  # afgesproken nul-urendag niet ingepland: zwaarder dan alles, alleen een harde regel kan het tegenhouden
-W_CONTRACT = 120  # per dienst onder de contracturen
+W_CONTRACT = 500  # per dienst onder de contracturen: iedereen op contract, alleen open plekken en vaste afspraken gaan voor
 W_WEEK_MIN = 40  # geen doordeweekse avond / geen weekenddienst die week
 W_WEEKEND_EXTRA = 200  # meer mensen in het weekend dan nodig
+W_QUIET = 20  # extra persoon doordeweeks op een dienst zonder wedstrijden; minder naarmate het drukker is (game_weight)
+W_OVER_CAP = 650  # per persoon boven MAX_PER_CHANNEL: zwaarder dan contracturen, lichter dan vaste afspraken
+MAX_PER_CHANNEL = sch.MAX_PER_CHANNEL  # aanvullen: hoogstens 2 per kanaal in een dienst (tenzij de bezetting meer vraagt)
 W_SECOND_WEEKEND = 20  # tweede weekenddienst in een week
 W_REPEAT = 10  # zelfde weekenddienst (bijv. zaterdagavond) twee weken achter elkaar
 W_PREF = 40  # dienst tegen de voorkeur in
@@ -55,7 +58,7 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
     rules_df = person_rules if person_rules is not None else pd.DataFrame(columns=["naam", "regel", "waarde"])
     min_rest = timedelta(hours=min_rest_hours)
 
-    people = team[team["actief"] & (team["auto"] | team["nuluren"])]  # nuluren: altijd op de afgesproken dagen
+    people = sch.planned_people(team, rules_df)  # nuluren: altijd op de afgesproken dagen
     info = {r.naam: r for r in people.itertuples()}
     names = list(info)
     weeks = sorted({sch.week_key(d) for d in days})
@@ -72,17 +75,19 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
     together = {r.naam for r in rules_df.itertuples() if r.regel == sch.RULE_EVENING_TOGETHER}
     never_with = [(r.naam, r.waarde) for r in rules_df.itertuples() if r.regel == sch.RULE_NOT_WITH]
     late_ok = {n for n in names if sch.late_day_ok(n, rules_df)}
+    agreed_by = {n: sch.agreed_days(n, rules_df) for n in names}
 
     def statically_ok(n, d, s, k) -> bool:
         p = info[n]
         if k not in sch.channels_of(p.kanalen):
             return False
-        if p.vaste_dienst and p.vaste_dienst != s:
+        forced = agreed_by[n].get(d) in (sch.ANY_SHIFT, s)  # Specific dates/nuluren gaan voor Employees
+        if p.vaste_dienst and p.vaste_dienst != s and not forced:
             return False
-        if getattr(p, "geen_avond", False) and s == sch.EVENING:
+        if getattr(p, "geen_avond", False) and s == sch.EVENING and not forced:
             return False
         free = sch.parse_free_days(p.vrije_dagen) | ({sch.SATURDAY, sch.SUNDAY} if p.seniority == sch.INTERN else set())
-        if d.weekday() in free:
+        if d.weekday() in free and d not in agreed_by[n]:  # Specific dates/nuluren gaan voor vrije dag en stage-weekend
             return False
         if sch._is_absent(n, d, absence_map, s):
             return False
@@ -206,6 +211,10 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
                 m.Add(v <= sum(others)) if others else m.Add(v == 0)
 
     # --- bezetting: open plekken zo min mogelijk ------------------------------------
+    def quiet(d, s) -> int:
+        """Kosten van een extra persoon doordeweeks: hoog als er weinig te doen is, 0 bij veel/grote wedstrijden."""
+        return max(0, W_QUIET - int(games.get((d, s), 0)))
+
     need = sch.requirements(calendar, rules)
     for r in need.itertuples():
         if r.dienst not in plan_shifts:
@@ -219,24 +228,31 @@ def optimize_schedule(team, shifts, rules, calendar, absences, min_rest_hours=11
         if sch.is_weekend(r.datum):
             terms.append(W_WEEKEND_EXTRA * extra)  # weekend: geen aanvulling tot contracturen
         else:
-            terms.append(max(0, 3 - min(games.get((r.datum, r.dienst), 0), 3)) * extra)  # extra waar het druk is
+            terms.append(quiet(r.datum, r.dienst) * extra)  # extra waar de meeste/grootste wedstrijden zijn
     needed_keys = {(r.datum, r.dienst, r.kanaal) for r in need.itertuples()}
+    needed = need.groupby(["datum", "dienst", "kanaal"])["nodig"].sum().to_dict()
+    for (d, s, k), members in by_slot.items():  # aanvullen: niet meer dan 2 per kanaal (tenzij meer nodig is)
+        cap = max(MAX_PER_CHANNEL, int(needed.get((d, s, k), 0)))
+        if len(members) > cap:
+            over = m.NewIntVar(0, len(members), f"over_{d}_{s}_{k}")
+            m.Add(over >= sum(v for _, v in members) - cap)
+            terms.append(W_OVER_CAP * over)
     for (d, s, k), members in by_slot.items():  # kanaal/dienst zonder vraag: liever niemand extra
         if (d, s, k) not in needed_keys:
-            terms.extend((W_WEEKEND_EXTRA if sch.is_weekend(d) else 4) * v for n, v in members
+            terms.extend((W_WEEKEND_EXTRA if sch.is_weekend(d) else quiet(d, s) + 4) * v for n, v in members
                          if (n, k) not in not_alone)
 
     # --- vaste afspraken (zacht, zodat het rooster altijd lukt) ----------------------
     for n in names:
         p = info[n]
-        agreed = sch.zero_hour_days(n, rules_df)
+        agreed = sch.agreed_days(n, rules_df)  # nuluren en Specific dates: zwaarder dan alles
         always = sch.always_works(n, rules_df)
         fixed_days = sch.parse_free_days(p.vaste_dagen)
         for d in days:
             if sch._is_absent(n, d, absence_map):
                 continue
             want, weight = None, W_MUST
-            if agreed is not None and d in agreed:
+            if d in agreed:
                 want = None if agreed[d] == sch.ANY_SHIFT else agreed[d]
                 must, weight = True, W_ZERO
             elif any(d.weekday() in ds for _, ds in always):
