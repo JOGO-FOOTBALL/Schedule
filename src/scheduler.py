@@ -18,6 +18,7 @@ INTERN = "Intern"  # stagiairs werken altijd ma t/m vr (bij voorkeur overdag), n
 WEEKDAYS_ONLY = {0, 1, 2, 3, 4}
 # Weekend: zo nodig 2 diensten (za én zo), maar na een weekend met 2 is het weekend erna (en ervoor) maximaal 1.
 MAX_WEEKEND_SHIFTS = 2
+MAX_PER_CHANNEL = 2  # aanvullen tot contracturen: hoogstens zoveel mensen per kanaal in een dienst
 MIN_REST_HOURS = 11  # minimale rust tussen twee diensten (zoals de Arbeidstijdenwet)
 # Uitzondering: een dagdienst direct na een avonddienst mag, maar begint dan later (10:00–18:00, 10 uur rust).
 # De planner doet dat alleen waar nodig; in het rooster blijft het gewoon "Day".
@@ -61,6 +62,9 @@ RULE_LATE_OK = "Late day shift OK"  # waarde: yes; dagdienst 10:00–18:00 na ee
 # Nuluren (tab Zero hours): intern als regel met waarde "2026-10-12:Day;2026-10-14:Any". Alleen op die dagen
 # (en dan ook echt), nooit aanvullen tot contracturen. Niet zelf in Person rules te kiezen.
 RULE_ZERO = "Zero hours"
+# Specific dates (tab Specific dates): zelfde waarde als nuluren. Die dienst krijgt de persoon sowieso; de andere
+# dagen plant de planner zoals altijd. Wie niet automatisch gepland wordt, krijgt de dagen als nuluren (main.py).
+RULE_SPECIFIC = "Specific dates"
 # Uit Employees (niet zelf in Person rules te kiezen): avonden pas vanaf een datum, en avonden alleen samen.
 RULE_EVENING_FROM = "Evenings from"  # waarde: datum (YYYY-MM-DD)
 RULE_EVENING_TOGETHER = "Evenings only together"  # 's avonds nog iemand op hetzelfde kanaal
@@ -111,17 +115,36 @@ def _rows(person_rules) -> list:
     return person_rules if isinstance(person_rules, list) else list(person_rules.itertuples())
 
 
-def zero_hour_days(name: str, person_rules) -> dict[date, str] | None:
-    """Nuluren: {datum: dienst of 'Any'} waarop `name` werkt; None als die persoon geen nuluren heeft."""
+def zero_hour_days(name: str, person_rules, rule: str = RULE_ZERO) -> dict[date, str] | None:
+    """Nuluren: {datum: dienst of 'Any'} waarop `name` werkt; None als die persoon geen nuluren heeft.
+    Met rule=RULE_SPECIFIC: de dagen uit Specific dates."""
     result = None
     for r in _rows(person_rules):
-        if r.naam == name and r.regel == RULE_ZERO:
+        if r.naam == name and r.regel == rule:
             result = result or {}
             for part in str(r.waarde or "").split(";"):
                 if ":" in part:
                     day, shift = part.split(":", 1)
                     result[date.fromisoformat(day.strip())] = shift.strip() or ANY_SHIFT
     return result
+
+
+def agreed_days(name: str, person_rules) -> dict[date, str]:
+    """Alle dagen waarop `name` sowieso werkt: nuluren én Specific dates ({datum: dienst of 'Any'})."""
+    return {**(zero_hour_days(name, person_rules, RULE_SPECIFIC) or {}), **(zero_hour_days(name, person_rules) or {})}
+
+
+def set_on(name: str, day: date, dienst: str, person_rules) -> bool:
+    """Staat `name` op deze dag in Specific dates of nuluren, voor precies deze dienst (of Any)?
+    Dan gaat dat voor vaste diensten, 'geen avonden', vrije dagen en regels over dagen/diensten."""
+    shift = agreed_days(name, person_rules).get(day)
+    return shift is not None and shift in (ANY_SHIFT, dienst)
+
+
+def planned_people(team: pd.DataFrame, person_rules) -> pd.DataFrame:
+    """Wie de planner inplant: actief en Auto schedule, of met nuluren (ook via Specific dates)."""
+    zero = {r.naam for r in _rows(person_rules) if r.regel == RULE_ZERO}
+    return team[team["actief"] & (team["auto"] | team["nuluren"] | team["naam"].isin(zero))]
 
 
 def always_works(name: str, person_rules: pd.DataFrame | None) -> list[tuple[str, set[int]]]:
@@ -299,12 +322,17 @@ def rule_breaks(name: str, day: date, dienst: str, kanaal: str, crew: list[tuple
         return []
     others = [(n, k) for n, k in crew if n != name]
     problems = []
+    # Precies deze dienst staat in Specific dates (of nuluren): regels over dagen en diensten gelden dan niet.
+    forced = set_on(name, day, dienst, rows)
     for r in rows:
         if r.regel == RULE_NOT_WITH and name in (r.naam, r.waarde):
             partner = r.waarde if name == r.naam else r.naam
             if any(n == partner for n, _ in others):
                 problems.append(f"{name} may not work together with {partner}")
         if r.naam != name:
+            continue
+        if forced and r.regel in (RULE_NO_SHIFT, RULE_ONLY_SHIFT, RULE_ONLY_DAYS, RULE_NEVER_DAYS, RULE_EVENING_FROM,
+                                  RULE_ALWAYS):
             continue
         if r.regel == RULE_NO_SHIFT:
             shift, days = _shift_on_days(r.waarde)
@@ -327,6 +355,10 @@ def rule_breaks(name: str, day: date, dienst: str, kanaal: str, crew: list[tuple
                 problems.append(f"{name} (zero hours) only works on the agreed days")
             elif agreed[day] != ANY_SHIFT and agreed[day] != dienst:
                 problems.append(f"{name} (zero hours) works {agreed[day]} on {day:%d-%m}")
+        if r.regel == RULE_SPECIFIC:
+            agreed = zero_hour_days(name, person_rules, RULE_SPECIFIC) or {}
+            if day in agreed and agreed[day] != ANY_SHIFT and agreed[day] != dienst:
+                problems.append(f"{name} works {agreed[day]} on {day:%d-%m} (Specific dates)")
         if r.regel == RULE_ALWAYS:
             shift, _, days = str(r.waarde).partition(":")
             if day.weekday() in parse_free_days(days) and dienst.lower() != shift.strip().lower():
@@ -394,8 +426,9 @@ def generate_schedule(
             "ucl": bool(r.ucl),
             "no_evening": bool(getattr(r, "geen_avond", False)),
         }
-        for r in team[team["actief"] & (team["auto"] | team["nuluren"])].itertuples()
+        for r in planned_people(team, person_rules).itertuples()
     }
+    agreed = {name: agreed_days(name, person_rules) for name in people}  # nuluren en Specific dates
 
     total = Counter()
     per_week = Counter()
@@ -417,12 +450,13 @@ def generate_schedule(
         info, day, dienst = people[name], slot["datum"], slot["dienst"]
         if slot["kanaal"] not in info["channels"]:
             return False
-        if info["fixed_shift"] and info["fixed_shift"] != dienst:
+        forced = agreed[name].get(day) in (ANY_SHIFT, dienst)  # Specific dates/nuluren gaan voor Employees
+        if info["fixed_shift"] and info["fixed_shift"] != dienst and not forced:
             return False
-        if info["no_evening"] and dienst == EVENING:
+        if info["no_evening"] and dienst == EVENING and not forced:
             return False
-        if day.weekday() in info["free"] or day in worked_days[name]:
-            return False
+        if (day.weekday() in info["free"] and day not in agreed[name]) or day in worked_days[name]:
+            return False  # Specific dates/nuluren gaan voor een vrije dag en het stage-weekend
         if is_weekend_shift(day, dienst):  # za, zo en vrijdagavond
             week = week_key(day)
             done = weekend_shifts[(name, week)]
@@ -524,17 +558,20 @@ def generate_schedule(
 
     # 1. Vaste afspraken eerst, voor de hele periode: Always works (bijv. Jonathan ma/vr overdag), UCL-avonden
     #    (Rogier op main) en vaste dagen (Francisco op vrijdag). Dan houdt de rest rekening met hun rusttijd.
-    for day in sorted({s['datum'] for s in slots}):
+    #    Nuluren en Specific dates in een eerste ronde: die gaan voor (anders zit iemand al vol met vaste dagen).
+    for day, first in [(d, f) for f in (True, False) for d in sorted({s['datum'] for s in slots})]:
         for name, info in people.items():
-            agreed = zero_hour_days(name, person_rules)
+            mine = agreed[name]  # nuluren en Specific dates
+            if first != (day in mine):
+                continue
             always = [s for s, days in always_works(name, person_rules) if day.weekday() in days]
-            if agreed is not None and day in agreed:
-                shift = None if agreed[day] == ANY_SHIFT else agreed[day]
+            if day in mine:
+                shift = None if mine[day] == ANY_SHIFT else mine[day]
                 fixed = open_slot(name, day, shift)
-                if fixed is None and shift:  # alle plekken al vol: dan een extra plek in die dienst
+                if fixed is None and shift:  # alle plekken al vol (of "never alone"): dan een extra plek in die dienst
                     fixed = next(({"datum": day, "dienst": shift, "kanaal": k, "copy": 99, "naam": None}
                                   for k in info["channels"]
-                                  if eligible(name, {"datum": day, "dienst": shift, "kanaal": k})), None)
+                                  if eligible(name, {"datum": day, "dienst": shift, "kanaal": k}, planning=False)), None)
                     if fixed:
                         slots.append(fixed)
             elif always:
@@ -603,10 +640,11 @@ def generate_schedule(
                 # Eerst open (nog lege) verplichte plekken in deze week, ook in het weekend; dan pas extra plekken.
                 open_slots = [sl for sl in slots if sl["naam"] is None and week_key(sl["datum"]) == week
                               and eligible(name, sl)]
-                options = open_slots or [
+                options = open_slots or [  # extra plekken: hoogstens MAX_PER_CHANNEL per kanaal in een dienst
                     o for o in ({"datum": day, "dienst": dienst, "kanaal": kanaal, "copy": 99, "naam": None}
                                 for day in week_days for dienst in day_shifts[day] for kanaal in info["channels"])
-                    if eligible(name, o)
+                    if sum(1 for _, k in crew[(o["datum"], o["dienst"])] if k == o["kanaal"]) < MAX_PER_CHANNEL
+                    and eligible(name, o)
                 ]
                 if not options:
                     continue
@@ -777,11 +815,13 @@ def check_conflicts(
                 add(row, "Not active")
             if row["kanaal"] not in channels_of(person.kanalen):
                 add(row, f"Does not work on {CHANNEL_LABELS.get(row['kanaal'], row['kanaal'])}")
-            if person.vaste_dienst and row["dienst"] != person.vaste_dienst:
+            forced = set_on(name, row["datum"], row["dienst"], person_rules)  # Specific dates gaan voor
+            if person.vaste_dienst and row["dienst"] != person.vaste_dienst and not forced:
                 add(row, f"Always works {person.vaste_dienst}")
-            if getattr(person, "geen_avond", False) and row["dienst"] == EVENING:
+            if getattr(person, "geen_avond", False) and row["dienst"] == EVENING and not forced:
                 add(row, "Does not work evenings")
-            if row["datum"].weekday() in parse_free_days(person.vrije_dagen):
+            if row["datum"].weekday() in parse_free_days(person.vrije_dagen) \
+                    and row["datum"] not in agreed_days(name, person_rules):  # Specific dates gaan voor
                 add(row, "Fixed day off")
             if _is_absent(name, row["datum"], absence_map, row["dienst"]):
                 add(row, "Absent")
@@ -839,6 +879,12 @@ def check_conflicts(
                     and not ((assignments["naam"] == name) & (assignments["datum"] == d)).any():
                 issues.append({"datum": d, "naam": name, "dienst": shift,
                                "probleem": "Zero hours: agreed to work, but not scheduled"})
+    for name in {r.naam for r in person_rules if r.regel == RULE_SPECIFIC}:
+        for d, shift in (zero_hour_days(name, person_rules, RULE_SPECIFIC) or {}).items():
+            if d in (period or []) and not _is_absent(name, d, absence_map) \
+                    and not ((assignments["naam"] == name) & (assignments["datum"] == d)).any():
+                issues.append({"datum": d, "naam": name, "dienst": shift,
+                               "probleem": "Specific dates: set to work, but not scheduled"})
 
     for r in person_rules:
         if r.regel != RULE_ALWAYS or r.naam not in info or not info[r.naam].actief:
