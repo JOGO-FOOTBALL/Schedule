@@ -274,6 +274,11 @@ def load_zero_hours():
     return clean_zero_hours(_read("zero_hours", pd.DataFrame(columns=["naam", "datum", "dienst"])))
 
 
+def load_specific_dates():
+    """Tab Specific dates: zelfde kolommen als nuluren (naam, datum, dienst)."""
+    return clean_zero_hours(_read("specific_dates", pd.DataFrame(columns=["naam", "datum", "dienst"])))
+
+
 SENT_COLUMNS = ["shiftbase_id", "datum", "naam", "dienst", "kanaal", "verstuurd"]
 
 
