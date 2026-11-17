@@ -186,9 +186,9 @@ if games is not None:
     ucl_days = {g.datum for g in games.itertuples()
                 if (calendar_view.competition_of(g.competitie) or ("",))[0] == "ucl"}
 
-t_matches, t_shiftbase, t_events, t_team, t_zero, t_rules, t_absence = st.tabs(
-    ["⚽ Matches", "📋 Shiftbase", "⭐ Special events", "👥 Employees", "⏱️ Zero hours", "⚙️ Staffing rules",
-     "🏖️ Time off"]
+t_matches, t_shiftbase, t_events, t_team, t_zero, t_specific, t_rules, t_absence = st.tabs(
+    ["⚽ Matches", "📋 Shiftbase", "⭐ Special events", "👥 Employees", "⏱️ Zero hours", "📌 Specific dates",
+     "⚙️ Staffing rules", "🏖️ Time off"]
 )
 
 # --- Medewerkers ---------------------------------------------------------------------
@@ -465,6 +465,51 @@ with t_zero:
         # Iets aangepast of weggehaald: de tabel voortaan opbouwen vanuit wat nu is opgeslagen.
         reset_base("zero_hours", zero_hours)
 
+# --- Specific dates: diensten die iemand sowieso krijgt (zelfde logica als nuluren) -----
+
+with t_specific:
+    st.subheader("Specific dates")
+    st.caption(
+        "Shifts someone gets **for sure** when you click *Make schedule* (in the shift you choose, or wherever needed "
+        "with *Any*), just like zero hours. On other days they are scheduled as usual. People with *Auto schedule* "
+        "off are only scheduled on these days."
+    )
+    active_people = list(team.loc[team["actief"], "naam"])
+    with st.form("add_specific_dates", clear_on_submit=True, border=True):
+        s1, s2, s3, s4 = st.columns([2, 3, 2, 1], vertical_alignment="bottom")
+        s_name = s1.selectbox("Name", active_people, index=None, placeholder="Choose a person")
+        s_day = s2.date_input("Day", value=None, format="DD-MM-YYYY")
+        s_shift = s3.selectbox("Shift", ["Any", sch.DAY, sch.EVENING])
+        if s4.form_submit_button("➕ Add", type="primary", use_container_width=True):
+            if s_name and s_day:
+                added = pd.DataFrame([{"naam": s_name, "datum": s_day, "dienst": s_shift}])
+                current = storage.clean_zero_hours(pd.concat([base("specific_dates", storage.load_specific_dates), added]))
+                persist("specific_dates", current)
+                reset_base("specific_dates", current)
+                st.rerun()
+            else:
+                st.warning("Choose a person and a day first.")
+    st.caption("Change a name, day or shift by clicking the cell. Tick **Delete** to remove a line.")
+    edited_specific = st.data_editor(
+        base("specific_dates", storage.load_specific_dates).assign(delete=False),
+        key=editor_key("specific_dates"),
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "naam": st.column_config.SelectboxColumn("Name", options=list(team["naam"]), required=True),
+            "datum": st.column_config.DateColumn("Day", format="DD-MM-YYYY", required=True),
+            "dienst": st.column_config.SelectboxColumn("Shift", options=["Any", sch.DAY, sch.EVENING], default="Any"),
+            "delete": st.column_config.CheckboxColumn("Delete", default=False, help="Tick to remove this line"),
+        },
+    )
+    remove = edited_specific["delete"].fillna(False).astype(bool)
+    specific_dates = storage.clean_zero_hours(edited_specific[~remove].drop(columns="delete"))
+    before = storage.clean_zero_hours(base("specific_dates", storage.load_specific_dates))
+    persist("specific_dates", specific_dates)
+    if not specific_dates.reset_index(drop=True).equals(before.reset_index(drop=True)):
+        reset_base("specific_dates", specific_dates)
+
 # Regels voor de planner: de person rules plus de nuluren-afspraken (als interne regel per persoon).
 # Avonden pas vanaf een datum / alleen samen (Employees) als regels voor de planner.
 evening_rules = pd.DataFrame(
@@ -482,11 +527,23 @@ intern_rules = pd.DataFrame(
     columns=["naam", "regel", "waarde"],
 )
 
-planning_rules = pd.concat([person_rules, evening_rules, intern_rules, pd.DataFrame([
-    {"naam": n, "regel": sch.RULE_ZERO,
-     "waarde": ";".join(f"{r.datum.isoformat()}:{r.dienst}" for r in zero_hours[zero_hours["naam"] == n].itertuples())}
-    for n in zero_people
-], columns=["naam", "regel", "waarde"])], ignore_index=True)
+# Specific dates: wie automatisch gepland wordt, krijgt die diensten erbij (RULE_SPECIFIC). Wie niet (Auto schedule
+# uit) of nuluren heeft, werkt alleen op die dagen: dan tellen ze als nuluren-dagen.
+auto_people = set(team.loc[team["actief"] & team["auto"] & ~team["nuluren"], "naam"])
+extra_days = specific_dates[specific_dates["naam"].isin(set(team.loc[team["actief"], "naam"]))]
+as_zero = pd.concat([zero_hours[zero_hours["naam"].isin(zero_people)], extra_days[~extra_days["naam"].isin(auto_people)]])
+
+
+def _days_value(rows: pd.DataFrame) -> str:
+    return ";".join(f"{r.datum.isoformat()}:{r.dienst}" for r in rows.itertuples())
+
+
+planning_rules = pd.concat([person_rules, evening_rules, intern_rules, pd.DataFrame(
+    [{"naam": n, "regel": sch.RULE_ZERO, "waarde": _days_value(as_zero[as_zero["naam"] == n])}
+     for n in dict.fromkeys(zero_people + list(as_zero["naam"]))]
+    + [{"naam": n, "regel": sch.RULE_SPECIFIC, "waarde": _days_value(extra_days[extra_days["naam"] == n])}
+       for n in dict.fromkeys(extra_days.loc[extra_days["naam"].isin(auto_people), "naam"])],
+    columns=["naam", "regel", "waarde"])], ignore_index=True)
 
 unavailable = absences  # vrij/afwezig (Time off), zoals de planner en de controles het gebruiken
 
@@ -534,13 +591,15 @@ def match_extras() -> dict[date, list[tuple]]:
 
 
 extras_by_day = match_extras()
+# Per dienst hoe druk het is: elke wedstrijd telt mee, grote wedstrijden (topclubs, El Clásico) zwaarder.
 games_per_shift: dict[date, dict[str, int]] = {}
 for g in (games.itertuples() if games is not None else []):
     shift = calendar_view.game_shift(g.tijd)
-    games_per_shift.setdefault(g.datum, {})[shift] = games_per_shift.get(g.datum, {}).get(shift, 0) + 1
+    games_per_shift.setdefault(g.datum, {})[shift] = (games_per_shift.get(g.datum, {}).get(shift, 0)
+                                                      + matches.game_weight(g, clubs, sch.TOP_CLUBS))
 
 # Per dag van de periode: het dagtype (automatisch uit de wedstrijden), extra bezetting voor wedstrijden en events,
-# en het aantal wedstrijden per dienst (extra mensen bij het aanvullen tot contract gaan waar het druk is).
+# en per dienst hoe druk het is (extra mensen bij het aanvullen tot contract gaan waar de meeste/grootste wedstrijden zijn).
 calendar = pd.DataFrame({"datum": period})
 calendar["dagtype"] = calendar["datum"].map(lambda d: sch.auto_day_type(d, ucl_days))
 calendar["extras"] = calendar["datum"].map(lambda d: extras_by_day.get(d, []))
@@ -850,19 +909,24 @@ def new_rule_breaks(before: pd.DataFrame, after: pd.DataFrame, include_allowed: 
     return new if include_allowed else [p for p in new if not manual_ok(p)]
 
 
+def adds_problem(name: str, day: date, dienst: str, kanaal: str) -> str | None:
+    """Welke regel breekt `name` als die er in deze dienst bij komt (weekendregel e.d., zoals bij slepen)?"""
+    # Snel: alleen de diensten van die persoon en van die dag bekijken (niet het hele rooster).
+    part = roster[(roster["naam"] == name) | (roster["datum"] == day)]
+    new_row = pd.DataFrame([{"datum": day, "dienst": dienst, "kanaal": kanaal, "naam": name}])
+    broken = new_rule_breaks(part, pd.concat([part, new_row], ignore_index=True))
+    return broken[0] if broken else None
+
+
+OPEN_PICKER_HIDDEN = ("Mats", "Rogier", "Tim")  # niet in de keuzelijst bij een rode "open"-plek (wel via +)
+
+
 def open_candidates(missing: dict, only: str | None = None) -> dict[str, dict]:
     """Per open plek ("datum|dienst|kanaal") wie die dienst volgens alle regels echt kan doen ("ok"),
     en per andere medewerker op dat kanaal waarom niet ("blocked": [naam, reden]).
     Alleen voor de plek waarop net geklikt is (`only`): alles uitrekenen maakt elke klik traag."""
     if not only:
         return {}
-    def adds_problem(name, day, dienst, kanaal) -> str | None:
-        # Snel: alleen de diensten van die persoon en van die dag bekijken (niet het hele rooster).
-        part = roster[(roster["naam"] == name) | (roster["datum"] == day)]
-        new_row = pd.DataFrame([{"datum": day, "dienst": dienst, "kanaal": kanaal, "naam": name}])
-        broken = new_rule_breaks(part, pd.concat([part, new_row], ignore_index=True))
-        return broken[0] if broken else None
-
     day, dienst, kanaal = only.split("|")
     day = date.fromisoformat(day)
     if kanaal not in missing.get((day, dienst), {}):
@@ -872,6 +936,8 @@ def open_candidates(missing: dict, only: str | None = None) -> dict[str, dict]:
     channels = team.set_index("naam")["kanalen"]
     ok, blocked = [], []
     for n in active["naam"]:
+        if n in OPEN_PICKER_HIDDEN:
+            continue
         if kanaal not in (sch.channels_of(channels.get(n, "")) or sch.CHANNELS):
             continue  # werkt niet op dit kanaal: niet de moeite van uitleggen
         if n in set(here["naam"]):
@@ -912,7 +978,7 @@ def explain_hours(name: str, days: list[date]) -> str:
                 if problem is None:
                     here = roster[(roster["datum"] == d) & (roster["dienst"] == shift)]
                     broken = sch.rule_breaks(name, d, shift, k, list(zip(here["naam"], here["kanaal"])), planning_rules)
-                    problem = broken[0] if broken else None
+                    problem = broken[0] if broken else adds_problem(name, d, shift, k)  # o.a. de weekendregel
                 if problem is None:
                     reasons.insert(0, f"could do {shift} on {sch.CHANNEL_LABELS[k]} (drag or + to add)")
                     break
