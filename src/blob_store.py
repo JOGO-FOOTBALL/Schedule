@@ -24,7 +24,7 @@ import config  # noqa: F401  (laadt .env, zodat SCHEDULE_BLOB_CONTAINER ook zond
 
 FILES = {
     "employees.csv", "schedule.csv", "staffing.csv", "match_staffing.csv", "person_rules.csv",
-    "afwezigheid.csv", "zero_hours.csv", "events.csv", "shiftbase_sent.csv",
+    "afwezigheid.csv", "zero_hours.csv", "specific_dates.csv", "events.csv", "shiftbase_sent.csv",
 }
 PREFIX = "data/"
 BACKUP = PREFIX + "backup/"
