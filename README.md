@@ -39,7 +39,7 @@ Secrets (passwords, keys) come from `.env` or Azure Key Vault, through `config.p
 
 | File | What it does |
 |---|---|
-| `main.py` | **The app itself.** This is where it starts. Builds every screen: the calendar with the schedule (tab *Matches*), the same calendar with what is in Shiftbase now (tab *Shiftbase*, read only) and the tabs *Special events*, *Employees*, *Zero hours*, *Staffing rules* and *Time off*. Also handles every click: dragging, ×, +, changing a channel, filling open slots, the Shiftbase dialog. |
+| `main.py` | **The app itself.** This is where it starts. Builds every screen: the calendar with the schedule (tab *Matches*), the same calendar with what is in Shiftbase now (tab *Shiftbase*, read only) and the tabs *Special events*, *Employees*, *Zero hours*, *Specific dates*, *Staffing rules* and *Time off*. Also handles every click: dragging, ×, +, changing a channel, filling open slots, the Shiftbase dialog. |
 | `calendar_view.py` | **Draws the calendar** as HTML in 433 style (black, white, neon yellow). Per day the rows Night/Day/Evening with the people, the match cards with logos, red "open" slots, and per week the hours column (red = too few hours, orange = too many). |
 | `scheduler.py` | **The scheduling rules.** Knows how many people are needed per day, shift and channel, and checks whether a schedule breaks a rule (rest time of 11 hours, fixed in the code as `MIN_REST_HOURS`, max shifts per week, weekend rule, days off, person rules, and so on). Also contains the simple fallback planner. |
 | `optimizer.py` | **The smart planner.** Uses Google OR-Tools to look at all weeks at once and find the best schedule: first as few open slots as possible, then fixed agreements, then contract hours, then preferences. If that fails, `scheduler.py` falls back to the simple planner. |
@@ -87,6 +87,7 @@ This is where the app stores everything you enter in it. Each tab has its own fi
 | `person_rules.csv` | Person rules, e.g. "Karel only works on Main". |
 | `afwezigheid.csv` | Time off and leave (whole day, day only or evening only). |
 | `zero_hours.csv` | Agreed days of zero-hours employees. |
+| `specific_dates.csv` | Shifts someone gets for sure (tab *Specific dates*); created the first time you add a line. |
 | `events.csv` | Special events (e.g. Ballon d'Or). |
 | `shiftbase_sent.csv` | Which shifts this tool has sent to Shiftbase (needed for *Undo*). |
 
@@ -126,7 +127,8 @@ This needs *ODBC Driver 18 for SQL Server* installed on your computer; without i
 ## How to use the app
 
 1. **Update the team** (tab *Employees*): channels, contract hours, Shiftbase ID, fixed days off, and so on.
-2. **Enter time off** (tab *Time off*) and any zero-hours days (tab *Zero hours*).
+2. **Enter time off** (tab *Time off*), any zero-hours days (tab *Zero hours*) and shifts someone gets for sure
+   (tab *Specific dates*).
 3. **Check the rules** (tab *Staffing rules*): staffing per day type, person rules and extra staffing for matches.
 4. **Make a schedule**: choose *From week* and *Until week* at the top and click **Make schedule**.
    Nothing is ever scheduled on its own: only when you click that button.
@@ -146,7 +148,8 @@ This needs *ODBC Driver 18 for SQL Server* installed on your computer; without i
 
 - At most 2 weekend shifts per week (Friday evening counts as weekend). After such a weekend, the weekend before and after has at most 1.
 - At least 11 hours rest between shifts and no more shifts per week than set in *Employees*.
-- Topping up to contract hours only happens on weekdays, preferably on shifts with many matches.
+- Everyone is topped up to their contract hours (only open slots and fixed agreements come first), preferably on
+  weekdays and on shifts with many matches.
 - Interns work Mon–Fri day shifts, never at weekends, and never alone on their channel.
 - Champions League evening: 2 on Main, 2 on App, 2 on NL.
 
