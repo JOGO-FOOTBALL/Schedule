@@ -348,11 +348,10 @@ def _hours(week_start: date, roster: pd.DataFrame | None, contracts: dict[str, i
            shift_hours: dict[str, float], away: dict[str, set[date]], explain=None) -> str:
     """Per persoon de ingeplande uren in deze week naast de contracturen.
 
-    Wie de hele week weg is (vrij), telt niet mee; wie een paar dagen
-    weg is, wordt vergeleken met de uren die nog konden (bijv. 2 dagen beschikbaar = 16 uur).
+    Altijd tegen het hele contract, ook met vrije dagen: wie de 40 uur niet haalt, staat erbij. Bij vrij staat
+    eronder welke dagen (bijv. "Time off Mon, Tue").
     """
     week_days = {week_start + timedelta(days=i) for i in range(7)}
-    contracts = {n: c for n, c in contracts.items() if not week_days <= away.get(n, set())}
     worked: dict[str, float] = {}
     if roster is not None:
         for r in roster[roster["datum"].isin(week_days)].itertuples():
@@ -362,15 +361,17 @@ def _hours(week_start: date, roster: pd.DataFrame | None, contracts: dict[str, i
     rows = []
     for name in list(contracts) + [n for n in worked if n not in contracts]:
         hours, contract = worked.get(name, 0), contracts.get(name, 0)
-        # Een paar dagen vrij: vergelijk met wat er nog kon (max één dienst van 8 uur per beschikbare dag).
-        available = len(week_days - away.get(name, set()))
-        contract = min(contract, available * sch.SHIFT_HOURS)
         if not contract or hours == contract:
             continue  # alleen wie meer of minder uren heeft dan het contract
         status = " under" if hours < contract else " over"
         value = f"{hours:g}/{contract}" if contract else f"{hours:g}"
-        why = explain(name, sorted(week_days)) if explain and status == " under" else ""
+        off = sorted(week_days & away.get(name, set()))
+        why = explain(name, sorted(week_days - set(off))) if explain and status == " under" else ""
         short_why = _short_reason(why)
+        if off and status == " under":  # vrij: dat eerst noemen, daarna eventueel wat nog kon
+            off_text = "Time off all week" if len(off) == 7 else "Time off " + ", ".join(sch.WEEKDAYS[d.weekday()] for d in off)
+            why = off_text + (chr(10) + why if why else "")
+            short_why = off_text + (f" · {short_why}" if short_why.startswith("Could") else "")
         rows.append(f'<div class="mc-hours-row{status}" title="{escape(name)}: {hours:g} h scheduled'
                     f'{f", contract {contract} h" if contract else ""}{escape(chr(10) + why) if why else ""}">'
                     f'<span>{escape(name)}</span><b>{value}</b></div>'
