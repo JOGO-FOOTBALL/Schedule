@@ -140,7 +140,11 @@ This needs *ODBC Driver 18 for SQL Server* installed on your computer; without i
 
    If a change breaks a rule, the app tells you why it isn't possible.
 6. **Check the hours** in the column on the right: red = under contract, orange = over contract. The reason is shown below it.
-7. **See what is in Shiftbase**: the tab *Shiftbase* shows the same calendar, but with the shifts as they are in Shiftbase now (read only; *Refresh* reads it again).
+7. **See what is in Shiftbase**: the tab *Shiftbase* shows the same calendar, but with the shifts as they are in Shiftbase now (*Refresh* reads it again).
+   To change Shiftbase directly, click **Adjust** next to a week: drag, × and + make a draft (nothing is sent yet).
+   **Send to Shiftbase** next to that week shows what will be created and deleted, and only after you confirm are the
+   changes made in Shiftbase (team Content only). **Cancel** throws away the changes of that week. The schedule in
+   *Matches* does not change.
 8. **To Shiftbase**: click *Send to Shiftbase* next to a week. You first see what will be sent.
    Only lines with status **new** are created. *Undo* removes them again.
 
