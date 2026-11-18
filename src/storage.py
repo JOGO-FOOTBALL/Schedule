@@ -296,6 +296,15 @@ def save_sent(df: pd.DataFrame) -> None:
     _write("shiftbase_sent", df[SENT_COLUMNS])
 
 
+DELETED_COLUMNS = ["shiftbase_id", "user_id", "naam", "datum", "dienst", "kanaal", "start", "eind", "verwijderd"]
+
+
+def log_deleted(row: dict) -> None:
+    """Elke dienst die Adjust (Shiftbase-tab) in Shiftbase verwijdert, met alle gegevens om hem terug te zetten."""
+    log = _read("shiftbase_deleted", pd.DataFrame(columns=DELETED_COLUMNS))
+    _write("shiftbase_deleted", pd.concat([log, pd.DataFrame([row])], ignore_index=True)[DELETED_COLUMNS])
+
+
 def load_roster():
     return clean_roster(_read("schedule", pd.DataFrame(columns=EMPTY["schedule"])))
 

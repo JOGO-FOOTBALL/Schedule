@@ -3,8 +3,9 @@
 De API-sleutel staat in .env als SHIFTBASE_API_KEY (aanmaken in Shiftbase: Settings > App center > Public API).
 Verbinding testen (alleen lezen), vanuit de projectmap:  python src/shiftbase.py
 
-Lezen gebeurt met GET. Versturen (create_roster) maakt ALLEEN nieuwe diensten aan; undo (delete_roster) haalt
-alleen diensten weg die deze tool zelf heeft aangemaakt (bijgehouden in data/shiftbase_sent.csv).
+Lezen gebeurt met GET. Send to Shiftbase (Matches) maakt ALLEEN nieuwe diensten aan; undo (delete_roster) haalt
+alleen diensten weg die deze tool zelf heeft aangemaakt (bijgehouden in data/shiftbase_sent.csv). Adjust in de
+Shiftbase-tab kan ook bestaande diensten van team Content verwijderen, altijd pas na een overzicht en bevestiging.
 """
 
 from __future__ import annotations
@@ -62,7 +63,8 @@ def create_roster(body: dict) -> str:
 
 
 def delete_roster(roster_id: str) -> None:
-    """Verwijder één dienst; alleen gebruikt voor diensten die deze tool zelf heeft aangemaakt (undo)."""
+    """Verwijder één dienst. Gebruikt door Undo (alleen eigen diensten) en door Adjust in de Shiftbase-tab
+    (alleen team Content, na een overzicht en een bevestiging)."""
     status, data = _request("DELETE", f"rosters/{roster_id}")
     if not 200 <= status < 300:
         raise RuntimeError(f"Shiftbase could not delete shift {roster_id} (HTTP {status}): {data}")
@@ -150,7 +152,9 @@ def existing_rosters(min_date: date, max_date: date) -> list[dict]:
             result.append({"id": str(r.get("id")), "user_id": str(r.get("user_id")), "date": str(r.get("date")),
                            "shift_id": str(r.get("shift_id")), "starttime": str(r.get("starttime"))[:5],
                            "endtime": str(r.get("endtime"))[:5], "description": str(r.get("description") or ""),
-                           "user_name": str(user.get("first_name") or user.get("name") or "").strip()})
+                           "user_name": str(user.get("first_name") or user.get("name") or "").strip(),
+                           # Terugkerende dienst: één id voor de hele reeks; verwijderen raakt dan alle dagen.
+                           "recurring": str(r.get("recurring")).strip().lower() in ("1", "true", "yes")})
     return result
 
 
@@ -165,23 +169,66 @@ def calendar_roster(min_date: date, max_date: date, names: dict[str, str], hidde
     by_shift_id = {v: k for k, v in SHIFT_IDS.items()}
     channels = {v.lower(): k for k, v in CHANNEL_NOTE.items()}
     rows = []
+    seen = set()
     day = min_date
     while day <= max_date:  # per week ophalen: kleine verzoeken
         last = min(day + timedelta(days=6), max_date)
         for r in existing_rosters(day, last):
+            # Elke dienst één keer, in de week waar hij hoort. Let op: een terugkerende dienst heeft op elke dag
+            # hetzelfde id, dus id + datum (niet alleen het id).
+            if (r["id"], r["date"]) in seen or not day <= date.fromisoformat(r["date"]) <= last:
+                continue
+            seen.add((r["id"], r["date"]))
             start, end = r["starttime"], r["endtime"]
             dienst = by_shift_id.get(r["shift_id"]) or ("Night" if start < "06:00" else "Evening" if start >= "15:00" else "Day")
-            name = names.get(r["user_id"]) or r["user_name"] or f"#{r['user_id']}"
-            if name in hidden:
+            person = names.get(r["user_id"]) or r["user_name"] or f"#{r['user_id']}"
+            if person in hidden:
                 continue
             # Tijden kort achter de naam, bijv. "Karel 9–17", "Joshua 10:30–18" of "Thomas 16–24" (tot middernacht)
             short = [str(int(t[:2])) + ("" if t.endswith(":00") else t[2:]) for t in (start, end)]
-            name += f" {short[0]}–{'24' if end == '00:00' else short[1]}"
+            name = person + f" {short[0]}–{'24' if end == '00:00' else short[1]}"
             note = r["description"].strip().lower()
             rows.append({"datum": date.fromisoformat(r["date"]), "dienst": dienst,
-                         "kanaal": channels.get(note, ""), "naam": name})
+                         "kanaal": channels.get(note, ""), "naam": name,
+                         "persoon": person, "uren": _hours_between(start, end),  # voor de urenkolom
+                         "id": r["id"], "user_id": r["user_id"], "start": start, "end": end,  # voor Adjust
+                         "recurring": bool(r.get("recurring"))})
         day = last + timedelta(days=1)
-    return pd.DataFrame(rows, columns=["datum", "dienst", "kanaal", "naam"])
+    return pd.DataFrame(rows, columns=CALENDAR_COLUMNS)
+
+
+CALENDAR_COLUMNS = ["datum", "dienst", "kanaal", "naam", "persoon", "uren", "id", "user_id", "start", "end", "recurring"]
+
+
+def _hours_between(start: str, end: str) -> float:
+    """Uren van start tot eind ("16:00"–"00:00" = 8); over middernacht telt door."""
+    try:
+        s, e = (int(t[:2]) * 60 + int(t[3:5]) for t in (start, end))
+    except ValueError:
+        return 0.0
+    return ((e - s) % (24 * 60) or 24 * 60) / 60
+
+
+def repeating_ids(ids: set[str], around: date, days: int = 182) -> set[str]:
+    """Welke van deze dienst-id's horen bij een terugkerende dienst? (zelfde id op meer dagen, of recurring aan)
+    Kijkt een half jaar voor en na `around`, per maand. Bij twijfel (kan Shiftbase niet lezen): allemaal."""
+    if not ids:
+        return set()
+    dates: dict[str, set[str]] = {}
+    found = set()
+    day, last = around - timedelta(days=days), around + timedelta(days=days)
+    try:
+        while day <= last:
+            until = min(day + timedelta(days=30), last)
+            for r in existing_rosters(day, until):
+                if r["id"] in ids:
+                    dates.setdefault(r["id"], set()).add(r["date"])
+                    if r.get("recurring"):
+                        found.add(r["id"])
+            day = until + timedelta(days=1)
+    except Exception:
+        return set(ids)
+    return found | {i for i, ds in dates.items() if len(ds) > 1}
 
 
 def shift_breaks() -> dict[str, str]:

@@ -683,7 +683,10 @@ nearby = full_roster[(full_roster["datum"] >= start - timedelta(days=10)) & (ful
 # de verplaatsing terug naar Python, die het rooster aanpast en opslaat.
 
 CALENDAR_JS = """
-export default function({ data, parentElement, setTriggerValue }) {
+export default function({ data, parentElement, setTriggerValue: sendTrigger }) {
+  // Elke actie krijgt een uniek nummer: Python verwerkt dezelfde actie zo nooit twee keer.
+  const setTriggerValue = (name, value) => sendTrigger(name, value && typeof value === "object"
+    ? { ...value, nonce: `${Date.now()}-${Math.random()}` } : value);
   let root = parentElement.querySelector(".mc-root");
   if (!root) {
     root = document.createElement("div");
@@ -696,6 +699,12 @@ export default function({ data, parentElement, setTriggerValue }) {
   root.querySelectorAll(".mc-sb").forEach((btn) =>
     btn.addEventListener("click", () => setTriggerValue("shiftbase", btn.dataset.sbWeek)));
   // Clear week: eerst bevestigen, dan iedereen uit die week halen.
+  // Eigen knoppen naast de week (Shiftbase-tab: Adjust, Send to Shiftbase, Cancel); eventueel eerst bevestigen.
+  root.querySelectorAll(".mc-act").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      if (btn.dataset.confirm && !window.confirm(btn.dataset.confirm)) return;
+      setTriggerValue("week_action", { action: btn.dataset.action, week: btn.dataset.week });
+    }));
   root.querySelectorAll(".mc-clear").forEach((btn) =>
     btn.addEventListener("click", () => {
       if (window.confirm("Remove everyone from this week? Days that are already past stay as they are."))
@@ -1137,6 +1146,14 @@ def shiftbase_week(week_start: date) -> None:
                 st.success(f"{removed} shift(s) removed from Shiftbase.")
 
 
+# Urenkolom (Matches én Shiftbase). Alleen wie meedoet in het rooster (Auto schedule aan): niet bijv. Tim/Rogier.
+hours_contracts = {n: (0 if z else c) for n, c, z, a in
+                   zip(active["naam"], active["contracturen"], active["nuluren"], active["auto"]) if a}
+hours_away = {n: {d for r in g.itertuples() if not r.deel for d in period if r.van <= d <= r.tot}
+              for n, g in unavailable.groupby("naam")}
+hours_per_shift = {r.dienst: (lambda w: (w[1] - w[0]).total_seconds() / 3600)(sch.shift_window(start, r.start, r.eind))
+                   for r in shifts.itertuples()}
+
 with t_matches:
     if match_error is not None:
         st.error(f"Loading matches failed: {match_error}")
@@ -1197,20 +1214,15 @@ with t_matches:
             now=pd.Timestamp.now(tz=matches.LOCAL_TZ).to_pydatetime(), clubs=clubs, league_urls=league_urls,
             events=events_by_day, roster=roster, flags=flags, missing=missing, explain=explain_hours,
             late=sch.late_days(pd.concat([nearby, roster], ignore_index=True)),  # dagdienst na avonddienst: 10–18
-            # Alleen wie meedoet in het rooster (Auto schedule aan): niet bijv. Tim/Rogier (Auto schedule uit).
-            contracts={n: (0 if z else c) for n, c, z, a in
-                       zip(active["naam"], active["contracturen"], active["nuluren"], active["auto"]) if a},
-            away={n: {d for r in g.itertuples() if not r.deel for d in period if r.van <= d <= r.tot}
-                  for n, g in unavailable.groupby("naam")},
-            shift_hours={r.dienst: (lambda w: (w[1] - w[0]).total_seconds() / 3600)(sch.shift_window(start, r.start, r.eind))
-                         for r in shifts.itertuples()},
+            contracts=hours_contracts, away=hours_away, shift_hours=hours_per_shift,
         )
         result = match_calendar(data={"html": html, "people": list(active["naam"]), "channels": sch.CHANNEL_LABELS,
                                       "open_candidates": open_candidates(missing, st.session_state.get("open_request")),
                                       "open_key": st.session_state.pop("open_request", None)},
                                 key="match_calendar",
                                 on_move_change=lambda: None, on_shiftbase_change=lambda: None,
-                                on_open_request_change=lambda: None, on_clear_week_change=lambda: None)
+                                on_open_request_change=lambda: None, on_clear_week_change=lambda: None,
+                                on_week_action_change=lambda: None)
         if result.move:
             message, ok = apply_move(result.move)
             st.session_state["moved"] = (message, ok)
@@ -1235,24 +1247,248 @@ with t_matches:
                                          f"({len(full) - len(updated)} shift(s) removed).", True)
             st.rerun()
 
-# --- Shiftbase: wat daar nu staat, in dezelfde kalender (alleen bekijken) -------------
+# --- Shiftbase: wat daar nu staat, in dezelfde kalender ---------------------------------
+# Bekijken; met Adjust een concept maken (slepen, ×, +) en dat met Send to Shiftbase versturen. Er gaat pas iets
+# naar Shiftbase na een overzicht en een bevestiging. Het rooster in Matches verandert hier niet.
+
+sb_ids = {n: str(i) for n, i in zip(team["naam"], team["shiftbase_id"]) if i}
+
+
+def sb_times(dienst: str, late: bool = False) -> tuple[str, str]:
+    """Tijden van een nieuwe dienst in Shiftbase; dagdienst direct na een avond: 10:00–18:00."""
+    if late:
+        return "10:00", "18:00"
+    row = shifts[shifts["dienst"] == dienst]
+    return (row["start"].iloc[0], row["eind"].iloc[0]) if not row.empty else ("", "")
+
+
+def sb_label(person: str, start_time: str, end_time: str) -> str:
+    """Naam met tijden, zoals in de Shiftbase-tab: "Karel 9–17"."""
+    short = [str(int(t[:2])) + ("" if t.endswith(":00") else t[2:]) for t in (start_time, end_time)]
+    return f"{person} {short[0]}–{'24' if end_time == '00:00' else short[1]}"
+
+
+def apply_sb_move(move: dict) -> tuple[str, bool]:
+    """Slepen, ×, + of ander kanaal in het concept (Adjust). Shiftbase zelf verandert hier nog niet."""
+    import shiftbase
+
+    draft, orig = st.session_state["sb_draft"].copy(), st.session_state["sb_orig"]
+    name = move["name"]
+    idx = None
+    if move.get("from_date"):
+        fd = date.fromisoformat(move["from_date"])
+        same = (draft["datum"] == fd) & (draft["dienst"] == move["from_shift"]) & (draft["persoon"] == name)
+        exact = draft.index[same & (draft["kanaal"] == (move.get("channel") or ""))]
+        idx = exact[0] if len(exact) else (draft.index[same][0] if same.any() else None)
+        if idx is None:
+            return f"{name} not found on {day_label(fd)} {move['from_shift']}", False
+        old_id = draft.loc[idx, "id"]
+        # Terugkerende dienst in Shiftbase (zelfde id op meer dagen): wijzigen of weghalen zou de hele reeks raken.
+        if old_id and ((orig["id"] == old_id).sum() > 1 or bool(draft.loc[idx].get("recurring", False))):
+            return (f"Not possible: {name}'s shift on {day_label(fd)} is part of a repeating shift in Shiftbase. "
+                    "Change that day in Shiftbase itself.", False)
+    if move.get("new_channel"):  # ander kanaal: in Shiftbase een nieuwe dienst (de oude gaat weg)
+        draft.loc[idx, ["kanaal", "id"]] = [move["new_channel"], ""]
+        st.session_state["sb_draft"] = draft
+        return f"{name} → {sch.CHANNEL_LABELS.get(move['new_channel'], move['new_channel'])} (not sent yet)", True
+    if idx is not None:
+        draft = draft.drop(idx)
+    if move.get("to_date"):
+        day = date.fromisoformat(move["to_date"])
+        if ((draft["datum"] == day) & (draft["persoon"] == name)).any():
+            return f"Not possible: {name} already works on {day_label(day)}", False
+        if name not in sb_ids:
+            return f"Not possible: {name} has no Shiftbase ID (Employees)", False
+        channel = move.get("channel") or (sch.channels_of(team.set_index("naam")["kanalen"].get(name, "")) or [""])[0]
+        # Terug op een plek waar die dienst al in Shiftbase stond: dan gewoon de oude houden (niets versturen).
+        back = orig[(orig["datum"] == day) & (orig["dienst"] == move["to_shift"]) & (orig["persoon"] == name)
+                    & (orig["kanaal"] == channel) & ~orig["id"].isin(set(draft["id"]))]
+        if not back.empty:
+            row = back.iloc[0].to_dict()
+        else:
+            begin, finish = sb_times(move["to_shift"])
+            row = {"datum": day, "dienst": move["to_shift"], "kanaal": channel, "naam": name, "persoon": name,
+                   "uren": shiftbase._hours_between(begin, finish), "id": "", "user_id": sb_ids[name],
+                   "start": begin, "end": finish}
+        draft = pd.concat([draft, pd.DataFrame([row])], ignore_index=True)
+        message = f"{name} → {day_label(day)} {move['to_shift']} (not sent yet)"
+    else:
+        message = f"{name} removed from {day_label(date.fromisoformat(move['from_date']))} {move['from_shift']} (not sent yet)"
+    st.session_state["sb_draft"] = draft.reset_index(drop=True)
+    return message, True
+
+
+def sb_changes(week_start: date | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(nieuw aan te maken, te verwijderen) volgens het concept, eventueel voor één week.
+    Nieuwe dagdiensten na een avond: 10:00–18:00."""
+    draft, orig = st.session_state["sb_draft"], st.session_state["sb_orig"]
+    new = draft[draft["id"] == ""].copy()
+    late = sch.late_days(draft.assign(naam=draft["persoon"]))
+    for i, r in new.iterrows():
+        new.loc[i, ["start", "end"]] = sb_times(r["dienst"], (r["datum"], r["persoon"]) in late)
+    gone = orig[~orig["id"].isin(set(draft["id"]))]
+    if week_start is not None:
+        days = {week_start + timedelta(days=i) for i in range(7)}
+        new, gone = new[new["datum"].isin(days)], gone[gone["datum"].isin(days)]
+    return new, gone
+
+
+def sb_reset_week(week_start: date, fresh: pd.DataFrame | None = None) -> None:
+    """Concept van één week terug naar Shiftbase (Cancel, of na versturen met `fresh` = opnieuw gelezen).
+    Geen wijzigingen meer over: Adjust stopt."""
+    days = {week_start + timedelta(days=i) for i in range(7)}
+    draft, orig = st.session_state["sb_draft"], st.session_state["sb_orig"]
+    source = orig if fresh is None else fresh
+    st.session_state["sb_draft"] = pd.concat([draft[~draft["datum"].isin(days)], source[source["datum"].isin(days)]],
+                                             ignore_index=True)
+    st.session_state["sb_orig"] = pd.concat([orig[~orig["datum"].isin(days)], source[source["datum"].isin(days)]],
+                                            ignore_index=True)
+    new, gone = sb_changes()
+    if new.empty and gone.empty:
+        for key in ("sb_edit", "sb_draft", "sb_orig"):
+            st.session_state.pop(key, None)
+
+
+@st.dialog("Send changes to Shiftbase", width="large")
+def sb_send(week_start: date) -> None:
+    import shiftbase
+
+    st.markdown(f"**Week {week_start.isocalendar()[1]}** · {week_start:%d-%m} – {week_start + timedelta(days=6):%d-%m} · team Content")
+    new, gone = sb_changes(week_start)
+    if new.empty and gone.empty:
+        all_new, all_gone = sb_changes()
+        weeks = sorted({d.isocalendar()[1] for d in pd.concat([all_new["datum"], all_gone["datum"]])})
+        st.info("No changes in this week yet. Drag, × or + in the calendar first."
+                + (f" Your changes are in week {', '.join(map(str, weeks))}: use **Send to Shiftbase** next to that "
+                   "week (the buttons are above their week)." if weeks else ""))
+        return
+
+    def table(df):
+        return df.assign(Shift=[f"{d} {s}–{e}" for d, s, e in zip(df["dienst"], df["start"], df["end"])],
+                         Channel=df["kanaal"].map(lambda k: sch.CHANNEL_LABELS.get(k, k))
+                         )[["datum", "persoon", "Shift", "Channel"]].rename(columns={"datum": "Date", "persoon": "Name"})
+
+    # Vangnet: nooit een terugkerende dienst verwijderen (dan gaat de hele reeks weg, niet alleen die dag).
+    with st.spinner("Checking Shiftbase for repeating shifts…"):
+        repeating = shiftbase.repeating_ids(set(gone["id"]), week_start)
+    if repeating:
+        st.error("These shifts are part of a **repeating shift** in Shiftbase. Deleting one would delete the whole "
+                 "series, so this is not possible from here. Change that day in Shiftbase itself, or **Cancel** "
+                 "this week.")
+        st.dataframe(table(gone[gone["id"].isin(repeating)]), hide_index=True, width="stretch", column_config={"Date": DATE})
+        return
+
+    if not new.empty:
+        st.markdown(f"**Create {len(new)} shift(s)**")
+        st.dataframe(table(new).sort_values(["Date", "Name"]), hide_index=True, width="stretch", column_config={"Date": DATE})
+    if not gone.empty:
+        st.markdown(f"**Delete {len(gone)} shift(s) from Shiftbase**")
+        st.dataframe(table(gone).sort_values(["Date", "Name"]), hide_index=True, width="stretch", column_config={"Date": DATE})
+    st.caption("Only team Content. New shifts are created first, then the old ones are deleted. "
+               "Deleting cannot be undone from here (the shift is gone in Shiftbase).")
+    if st.button(f"Yes, send to Shiftbase ({len(new)} new, {len(gone)} deleted)", type="primary", use_container_width=True):
+        breaks = shiftbase.shift_breaks()
+        made = removed = 0
+        try:
+            for r in new.itertuples():
+                shiftbase.create_roster(shiftbase.payload(r.datum, r.dienst, r.kanaal, r.user_id, r.start, r.end, breaks))
+                made += 1
+            for r in gone.itertuples():
+                # Eerst vastleggen wat er weggaat (om het zo nodig terug te zetten), dan pas verwijderen.
+                storage.log_deleted({"shiftbase_id": r.id, "user_id": r.user_id, "naam": r.persoon, "datum": r.datum,
+                                     "dienst": r.dienst, "kanaal": r.kanaal, "start": r.start, "eind": r.end,
+                                     "verwijderd": pd.Timestamp.now().isoformat(timespec="seconds")})
+                shiftbase.delete_roster(r.id)
+                removed += 1
+        except Exception as exc:
+            result = (f"Stopped after {made} created and {removed} deleted: {exc}. "
+                      "Check Shiftbase; the calendar now shows what is there.", False)
+        else:
+            result = (f"Shiftbase updated: {made} created, {removed} deleted.", True)
+        # Hoe dan ook: deze week opnieuw uit Shiftbase lezen; de andere weken van het concept blijven staan.
+        load_shiftbase.clear()
+        fresh = load_shiftbase(start, end, tuple((i, n) for n, i in zip(team["naam"], team["shiftbase_id"]) if i))
+        sb_reset_week(week_start, fresh.reset_index(drop=True))
+        st.session_state["sb_moved"] = result
+        st.rerun()
+
 
 with t_shiftbase:
+    editing = st.session_state.get("sb_edit") == period_key
     c1, c2 = st.columns([5, 1], vertical_alignment="bottom")
-    c1.caption("What is planned in **Shiftbase** right now (team Content), in the same calendar as *Matches*. "
-               "Read only: nothing is changed here. The times are shown after each name.")
-    if c2.button("↻ Refresh", use_container_width=True, help="Shiftbase is read again (otherwise every 5 minutes)."):
-        load_shiftbase.clear()
+    if editing:
+        c1.caption("**Adjusting.** Drag, × or + like in *Matches*; nothing goes to Shiftbase until you click "
+                   "**Send to Shiftbase** next to the week. **Cancel** throws away the changes of that week.")
+        pending_new, pending_gone = sb_changes()
+        lines = ([f"➕ {r.persoon} · {r.datum:%a %d-%m} {r.dienst} {r.start}–{r.end}" for r in pending_new.itertuples()]
+                 + [f"🗑 {r.persoon} · {r.datum:%a %d-%m} {r.dienst}" for r in pending_gone.itertuples()])
+        with st.expander(f"Pending changes ({len(lines)})", expanded=bool(lines)):
+            st.markdown("\n".join(f"- {line}" for line in lines) if lines else "No changes yet.")
+    else:
+        c1.caption("What is planned in **Shiftbase** right now (team Content), in the same calendar as *Matches*. "
+                   "The times are shown after each name. **Adjust** next to a week to make changes and send them.")
+        if c2.button("↻ Refresh", use_container_width=True, help="Shiftbase is read again (otherwise every 5 minutes)."):
+            load_shiftbase.clear()
+    if "sb_moved" in st.session_state:
+        message, ok = st.session_state.pop("sb_moved")
+        st.toast(message, icon="✅" if ok else "⛔")
     try:
         sb_roster = load_shiftbase(start, end, tuple((i, n) for n, i in zip(team["naam"], team["shiftbase_id"]) if i))
     except Exception as exc:  # geen sleutel, geen verbinding, ...
         st.error(f"Could not read Shiftbase: {type(exc).__name__}: {exc}")
     else:
-        st.html(calendar_view.render(
+        def sb_week_actions(week_start: date) -> list[tuple]:
+            """Knoppen naast de week, zoals Send to Shiftbase / Clear week in Matches."""
+            if not editing:
+                return [("adjust", "Adjust", "Change the Shiftbase schedule here, then send the changes", True, "")]
+            new_rows, gone_rows = sb_changes(week_start)
+            count = len(new_rows) + len(gone_rows)
+            return [("send", f"Send to Shiftbase{f' ({count})' if count else ''}",
+                     "See what will be created and deleted in Shiftbase for this week, then confirm", True, ""),
+                    ("cancel", "Cancel", "Throw away the changes in this week",
+                     False, "Throw away the changes in this week?" if count else "")]
+
+        draft = st.session_state["sb_draft"] if editing else None
+        sb_html = calendar_view.render(
             games if games is not None else pd.DataFrame(columns=["datum", "tijd", "aftrap", "competitie"]),
-            period, dict(zip(calendar["datum"], calendar["dagtype"])),
-            urls if match_error is None else {},
+            period, dict(zip(calendar["datum"], calendar["dagtype"])), urls if match_error is None else {},
             now=pd.Timestamp.now(tz=matches.LOCAL_TZ).to_pydatetime(), clubs=clubs,
-            league_urls=league_urls if match_error is None else {}, events=events_by_day, roster=sb_roster,
-            readonly=True,
-        ))
+            league_urls=league_urls if match_error is None else {}, events=events_by_day,
+            # In het concept de kale naam op de chip (slepen werkt op de naam); anders de naam met tijden.
+            roster=draft.assign(naam=draft["persoon"]) if editing else sb_roster,
+            readonly=not editing, week_actions=sb_week_actions,
+            # Urenkolom zoals bij Matches, met de echte tijden uit Shiftbase (bijv. 10–18 telt als 8 uur).
+            contracts=hours_contracts, away=hours_away, shift_hours=hours_per_shift,
+        )
+        people = [n for n in active["naam"] if n in sb_ids and n not in SHIFTBASE_TAB_HIDDEN]
+        sb_result = match_calendar(data={"html": sb_html, "people": people, "channels": sch.CHANNEL_LABELS,
+                                         "open_candidates": {}, "open_key": None},
+                                   key="sb_calendar",
+                                   on_move_change=lambda: None, on_shiftbase_change=lambda: None,
+                                   on_open_request_change=lambda: None, on_clear_week_change=lambda: None,
+                                   on_week_action_change=lambda: None)
+        # Elke actie (met uniek nummer uit de browser) maar één keer verwerken.
+        seen = st.session_state.setdefault("sb_seen", set())
+
+        def fresh_trigger(value):
+            if not value or value.get("nonce") in seen:
+                return None
+            seen.add(value.get("nonce"))
+            return value
+
+        move, action = fresh_trigger(sb_result.move), fresh_trigger(sb_result.week_action)
+        if editing and move:  # eerst de wijziging, dan pas eventuele knoppen
+            st.session_state["sb_moved"] = apply_sb_move(dict(move))
+            st.rerun()
+        if action and action["action"] == "adjust" and not editing:
+            load_shiftbase.clear()  # vers uit Shiftbase beginnen
+            fresh = load_shiftbase(start, end, tuple((i, n) for n, i in zip(team["naam"], team["shiftbase_id"]) if i))
+            st.session_state["sb_orig"] = fresh.reset_index(drop=True)
+            st.session_state["sb_draft"] = fresh.reset_index(drop=True)
+            st.session_state["sb_edit"] = period_key
+            st.rerun()
+        if editing and action and action["action"] == "send":
+            sb_send(date.fromisoformat(action["week"]))
+        if editing and action and action["action"] == "cancel":
+            sb_reset_week(date.fromisoformat(action["week"]))
+            st.rerun()
