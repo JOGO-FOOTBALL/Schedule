@@ -58,12 +58,12 @@ CSS = """
 
 .mc-week { margin-bottom:26px; }
 .mc-week-label { display:flex; align-items:baseline; gap:12px; margin-bottom:10px; }
-.mc-sb { margin-left:8px; padding:1px 7px; border:1px solid #fff; border-radius:5px; background:#fff; color:#000;
-         font-size:.58rem; font-weight:700; cursor:pointer; align-self:center; }
-.mc-sb:hover { background:var(--y); border-color:var(--y); }
-.mc-clear { padding:1px 7px; border:1px solid rgba(255,255,255,.5); border-radius:5px; color:#fff;
+.mc-sb, .mc-act.primary { margin-left:8px; padding:1px 7px; border:1px solid #fff; border-radius:5px; background:#fff;
+         color:#000; font-size:.58rem; font-weight:700; cursor:pointer; align-self:center; }
+.mc-sb:hover, .mc-act.primary:hover { background:var(--y); border-color:var(--y); }
+.mc-clear, .mc-act { padding:1px 7px; border:1px solid rgba(255,255,255,.5); border-radius:5px; color:#fff;
             font-size:.58rem; font-weight:700; cursor:pointer; align-self:center; }
-.mc-clear:hover { border-color:#ff5a5a; color:#ff5a5a; }
+.mc-clear:hover, .mc-act:not(.primary):hover { border-color:#ff5a5a; color:#ff5a5a; }
 .mc-week-label .mc-display { font-size:1.05rem; }
 .mc-week-label span.range { color:var(--y); font-family:var(--display); font-weight:600; font-size:.8rem; }
 .mc-grid { display:grid; grid-template-columns:repeat(7, minmax(0,1fr)); column-gap:8px; row-gap:0; }
@@ -355,7 +355,9 @@ def _hours(week_start: date, roster: pd.DataFrame | None, contracts: dict[str, i
     worked: dict[str, float] = {}
     if roster is not None:
         for r in roster[roster["datum"].isin(week_days)].itertuples():
-            worked[r.naam] = worked.get(r.naam, 0) + shift_hours.get(r.dienst, 0)
+            # Uit Shiftbase: de naam zonder tijden ("persoon") en de echte uren ("uren"); anders per dienst.
+            name = getattr(r, "persoon", None) or r.naam
+            worked[name] = worked.get(name, 0) + (getattr(r, "uren", None) or shift_hours.get(r.dienst, 0))
     if not worked:  # deze week is nog niet ingeroosterd
         return '<div class="mc-hours"><div class="mc-hours-title">Hours / contract</div>'                '<div class="mc-hours-ok">Not planned yet</div></div>'
     rows = []
@@ -389,8 +391,10 @@ def render(games: pd.DataFrame, period: list[date], day_types: dict[date, str],
            contracts: dict[str, int] | None = None,
            shift_hours: dict[str, float] | None = None, away: dict[str, set[date]] | None = None,
            flags: dict | None = None, missing: dict | None = None, explain=None, readonly: bool = False,
-           late: set | None = None) -> str:
-    """`readonly`: alleen bekijken (bijv. wat in Shiftbase staat): geen ×, + of Send to Shiftbase."""
+           late: set | None = None, week_actions=None) -> str:
+    """`readonly`: alleen bekijken (bijv. wat in Shiftbase staat): geen ×, + of Send to Shiftbase.
+    `week_actions`: in plaats van Send to Shiftbase / Clear week eigen knoppen naast elke week (Shiftbase-tab):
+    functie week_start -> [(actie, tekst, uitleg, primair, bevestigingsvraag of "")]."""
     crew_by_day = {d: g for d, g in roster.groupby("datum")} if roster is not None and not roster.empty else {}
     if games.empty and roster is None and not any(d in (events or {}) for d in period):
         return CSS + '<div class="mc"><div class="mc-empty">No matches in this period.</div></div>'
@@ -417,7 +421,11 @@ def render(games: pd.DataFrame, period: list[date], day_types: dict[date, str],
             + (f'<span class="mc-sb" data-sb-week="{week_start.isoformat()}" title="Send this week to Shiftbase">Send to Shiftbase</span>'
                f'<span class="mc-clear" data-clear-week="{week_start.isoformat()}" '
                f'title="Remove everyone from this week (days that are already past stay)">Clear week</span>'
-               if roster is not None else "")
+               if roster is not None and week_actions is None else "")
+            + "".join(f'<span class="mc-act{" primary" if primary else ""}" data-action="{escape(action)}" '
+                      f'data-week="{week_start.isoformat()}" data-confirm="{escape(confirm)}" title="{escape(tip)}">'
+                      f'{escape(label)}</span>'
+                      for action, label, tip, primary, confirm in (week_actions(week_start) if week_actions else []))
             + '</div>'
             f'<div class="mc-grid{" with-hours" if contracts else ""}">'
         )
@@ -479,4 +487,5 @@ def render(games: pd.DataFrame, period: list[date], day_types: dict[date, str],
                  '<b>433</b></div></div>')
     if readonly:
         parts.append("<style>.mc-x, .mc-add, .mc-sb, .mc-clear { display:none !important; } .mc-chip { cursor:default; }</style>")
+        return "".join(parts).replace('draggable="true"', 'draggable="false"')  # alleen bekijken: niet slepen
     return "".join(parts)
